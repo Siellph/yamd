@@ -8,7 +8,9 @@ import json
 import threading
 from pathlib import Path
 from typing import Optional
-
+import os
+import platform
+import subprocess
 import webview
 
 import config as cfg_module
@@ -215,14 +217,30 @@ class Api:
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    # def get_file_url(self, path: str) -> str:
-    #     """Возвращает file:// URL для воспроизведения локального файла."""
-    #     print(path)
-    #     return Path(path).resolve().as_uri()
-
     def get_file_url(self, rel_path: str) -> str:
         """Возвращает http://... URL для воспроизведения через локальный сервер."""
         return f"http://127.0.0.1:5000/audio/{rel_path}"
+
+    # ── Папка загрузок ───────────────────────────────────────────────────
+
+    def open_download_folder(self) -> None:
+        """Открывает папку загрузки в проводнике ОС."""
+        folder = self._cfg.get("download_dir") or "."
+        folder_path = os.path.realpath(folder)
+
+        if not os.path.exists(folder_path):
+            self._log(f"Папка не существует: {folder_path}", "err")
+            return
+
+        # Для Windows
+        if platform.system() == "Windows":
+            os.startfile(folder_path)
+        # Для macOS
+        elif platform.system() == "Darwin":
+            subprocess.Popen(["open", folder_path])
+        # Для Linux
+        else:
+            subprocess.Popen(["xdg-open", folder_path])
 
     # ── Системные диалоги ─────────────────────────────────────────────────
 

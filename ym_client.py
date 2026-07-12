@@ -15,6 +15,7 @@ from yandex_music.exceptions import DeviceAuthError
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
 
+
 def fmt_duration(ms: int | None) -> str:
     if not ms:
         return "—"
@@ -169,20 +170,70 @@ class YMClient:
         c = self._client
         if not c:
             return []
-        pls = c.users_playlists_list() or []
+
         result = []
-        for pl in pls:
+        uid = c.me.account.uid if c.me and c.me.account else None
+
+        # Вспомогательная функция для форматирования в словарь
+        def _format_playlist(pl, group: str) -> dict:
             cover = ""
-            if pl.cover and pl.cover.uri:
+            if pl.cover and getattr(pl.cover, 'uri', None):
                 cover = "https://" + pl.cover.uri.replace("%%", "100x100")
-            result.append({
+
+            owner_login = ""
+            if getattr(pl, 'owner', None) and getattr(pl.owner, 'login', None):
+                owner_login = pl.owner.login
+
+            url_owner = owner_login or "yandexmusic"
+
+            return {
                 "id": str(pl.kind),
                 "title": pl.title or "Плейлист",
-                "owner": pl.owner.login if pl.owner else "",
+                "owner": owner_login,
                 "count": pl.track_count or 0,
                 "cover": cover,
-                "url": f"https://music.yandex.ru/users/{pl.owner.login}/playlists/{pl.kind}" if pl.owner else "",
-            })
+                "url": f"https://music.yandex.ru/users/{url_owner}/playlists/{pl.kind}",
+                "group": group
+            }
+
+        # 1. Системный плейлист "Мне нравится" (Лайкнутые треки)
+        if uid:
+            try:
+                liked_pl = c.users_playlists(kind=3, user_id=uid)
+                if liked_pl:
+                    if not liked_pl.title:
+                        liked_pl.title = "Мне нравится"
+                    result.append(_format_playlist(liked_pl, "system"))
+            except Exception as e:
+                print(f"Ошибка получения 'Мне нравится': {e}")
+
+        # 2. Умные плейлисты Яндекса (Плейлист дня, Премьера, Дежавю и т.д.)
+        try:
+            feed = c.feed()
+            if feed and getattr(feed, 'generated_playlists', None):
+                for gpl in feed.generated_playlists:
+                    if getattr(gpl, 'data', None):
+                        result.append(_format_playlist(gpl.data, "smart"))
+        except Exception as e:
+            print(f"Ошибка получения умных плейлистов: {e}")
+
+        # 3. Созданные пользователем плейлисты
+        try:
+            pls = c.users_playlists_list() or []
+            for pl in pls:
+                result.append(_format_playlist(pl, "created"))
+        except Exception as e:
+            print(f"Ошибка получения созданных плейлистов: {e}")
+
+        # 4. Лайкнутые чужие плейлисты
+        try:
+            pls_likes = c.users_likes_playlists() or []
+            for item in pls_likes:
+                if getattr(item, 'playlist', None):
+                    result.append(_format_playlist(item.playlist, "liked"))
+        except Exception as e:
+            print(f"Ошибка получения лайкнутых плейлистов: {e}")
+
         return result
 
     # ── Получение треков по URL ────────────────────────────────────────────

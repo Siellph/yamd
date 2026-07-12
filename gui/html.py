@@ -291,7 +291,7 @@ audio{display:none;}
 <div class="layout">
   <nav class="sidebar">
     <button class="nav-item active" onclick="showPage('download',this)"><span class="nav-icon">⬇</span>Скачивание</button>
-    <button class="nav-item" onclick="showPage('playlists',this);loadMyPlaylists()"><span class="nav-icon">📋</span>Мои плейлисты</button>
+    <button class="nav-item" onclick="showPage('playlists',this);loadMyPlaylists()"><span class="nav-icon">📋</span>Плейлисты</button>
     <button class="nav-item" onclick="showPage('downloaded',this);scanDownloaded()"><span class="nav-icon">🎵</span>Скачанные</button>
     <button class="nav-item" onclick="showPage('settings',this)"><span class="nav-icon">⚙</span>Настройки</button>
     <div class="sidebar-footer">yandex-music-downloader</div>
@@ -361,6 +361,8 @@ audio{display:none;}
       <div class="toolbar">
         <span style="font-size:13px;font-weight:600">Скачанные треки</span>
         <button class="btn sm" onclick="scanDownloaded()">↻ Обновить</button>
+        <span id="dlCount" style="font-size:12px;color:var(--muted)"></span>
+        <button class="btn sm" onclick="window.pywebview.api.open_download_folder()">📂 Открыть папку</button>
         <span id="dlCount" style="font-size:12px;color:var(--muted)"></span>
       </div>
       <div id="dlList" style="flex:1;overflow-y:auto;border:1px solid var(--border);border-radius:var(--r)">
@@ -511,6 +513,8 @@ audio{display:none;}
   </div>
   <button class="btn sm ghost" onclick="playerClose()" title="Закрыть плеер">✕</button>
   <audio id="audioEl"
+    onplay="_updatePlayBtn()"
+    onpause="_updatePlayBtn()"
     onended="playerEnded()"
     ontimeupdate="playerTimeUpdate()"
     oncanplay="playerCanPlay()"
@@ -763,9 +767,18 @@ function trackRowHTML(t){
   const dlIcon={idle:'⬇',queued:'⏳',downloading:'⏳',done:'✓',error:'↺'}[t.status]||'⬇';
   const dlCls={done:'done',error:'error'}[t.status]||'';
   const dlDis=t.status==='downloading'||t.status==='queued'?'disabled':'';
+
   const isPlaying=S.playerTrackId===t.id&&S.playerSource==='tracks';
   const prvCls=isPlaying?'playing':'';
   const playingRow=isPlaying?'playing-row':'';
+
+  // Определяем актуальную иконку
+  let playIcon = '▶';
+  if (isPlaying) {
+    const audio = document.getElementById('audioEl');
+    if (audio && !audio.paused) playIcon = '⏸';
+  }
+
   return `<div class="tl-row ${t.status} ${playingRow}" id="row-${t.id}">
     <input type="checkbox" class="cb" ${checked} onchange="toggleTrack('${t.id}',this.checked)">
     <span class="tl-num">${t.num}</span>
@@ -776,7 +789,7 @@ function trackRowHTML(t){
     <div class="tl-album" title="${esc(t.album)}">${esc(t.album)}</div>
     <span class="tl-dur">${t.duration}</span>
     <span class="tl-status s-${t.status}">${statusLabel}</span>
-    <button class="iBtn ${prvCls}" title="Прослушать" onclick="previewTrack('${t.id}')">▶</button>
+    <button class="iBtn ${prvCls}" title="Прослушать" onclick="previewTrack('${t.id}')">${playIcon}</button>
     <button class="iBtn ${dlCls}" ${dlDis} title="Скачать" onclick="downloadOne('${t.id}')">${dlIcon}</button>
   </div>`;
 }
@@ -987,8 +1000,34 @@ function playerTimeUpdate(){
   if(a.duration) document.getElementById('plSeek').value=(a.currentTime/a.duration*100).toFixed(1);
 }
 function _updatePlayBtn(){
-  const paused=document.getElementById('audioEl').paused;
-  document.getElementById('plPlayBtn').textContent=paused?'▶':'⏸';
+  const audio = document.getElementById('audioEl');
+  const paused = audio ? audio.paused : true;
+  document.getElementById('plPlayBtn').textContent = paused ? '▶' : '⏸';
+
+  // Обновляем иконку в основном списке треков
+  if (S.playerSource === 'tracks' && S.playerTrackId) {
+    const row = document.getElementById('row-' + S.playerTrackId);
+    if (row) {
+      // Ищем именно активную кнопку прослушивания по классу playing
+      const btn = row.querySelector('.iBtn.playing');
+      if (btn) btn.textContent = paused ? '▶' : '⏸';
+    }
+  }
+  // Обновляем иконку в скачанных треках
+  else if (S.playerSource === 'downloaded' && S.playerTrackId) {
+    const idx = S.dlFiles.findIndex(f => f.rel_path === S.playerTrackId);
+    if (idx !== -1) {
+      const row = document.getElementById('dlrow-' + idx);
+      if (row) {
+        // Находим кнопку Play
+        const btn = row.querySelectorAll('.btn')[0];
+        if (btn) {
+          btn.textContent = paused ? '▶' : '⏸';
+          btn.title = paused ? 'Воспроизвести' : 'Играет';
+        }
+      }
+    }
+  }
 }
 
 /* ── Режимы ── */
@@ -1023,16 +1062,48 @@ function renderMyPlaylists(pls){
     document.getElementById('plGrid').innerHTML=`<div class="empty"><span class="empty-icon">📋</span><p>Плейлистов нет или нет авторизации</p></div>`;
     return;
   }
-  document.getElementById('plGrid').innerHTML=`<div class="pl-grid">${pls.map(pl=>`
-    <div class="pl-card" onclick="addPlaylistUrl('${esc(pl.url)}')" title="Добавить в очередь">
-      ${pl.cover
-        ?`<img class="pl-cover" src="${esc(pl.cover)}" alt="" onerror="this.style.display='none'">`
-        :`<div class="pl-cover-ph">🎵</div>`}
-      <div class="pl-info">
-        <div class="pl-name">${esc(pl.title)}</div>
-        <div class="pl-count">${pl.count} треков</div>
-      </div>
-    </div>`).join('')}</div>`;
+
+  // Заранее подготовленные категории
+  const groups = {
+    'system': { title: '❤️ Моя музыка', items: [] },
+    'smart':  { title: '✨ Умные плейлисты', items: [] },
+    'created':{ title: '👤 Созданные мной', items: [] },
+    'liked':  { title: '📌 Понравившиеся плейлисты', items: [] }
+  };
+
+  // Распределяем плейлисты по группам
+  pls.forEach(pl => {
+    const g = pl.group && groups[pl.group] ? pl.group : 'created';
+    groups[g].items.push(pl);
+  });
+
+  let html = '';
+
+  // Проходимся по каждой категории и генерируем HTML
+  for (const key in groups) {
+    if (groups[key].items.length > 0) {
+      // Заголовок категории (растягивается на всю ширину сетки благодаря grid-column: 1 / -1)
+      html += `
+        <div style="grid-column: 1 / -1; padding: 12px 6px 4px; font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--border); margin-bottom: 4px; margin-top: 4px;">
+          ${groups[key].title}
+        </div>
+      `;
+      // Карточки плейлистов этой категории
+      html += groups[key].items.map(pl=>`
+        <div class="pl-card" onclick="addPlaylistUrl('${esc(pl.url)}')" title="Добавить в очередь">
+          ${pl.cover
+            ?`<img class="pl-cover" src="${esc(pl.cover)}" alt="" onerror="this.style.display='none'">`
+            :`<div class="pl-cover-ph">🎵</div>`}
+          <div class="pl-info">
+            <div class="pl-name">${esc(pl.title)}</div>
+            <div class="pl-count">${pl.count} треков</div>
+          </div>
+        </div>`).join('');
+    }
+  }
+
+  // Оборачиваем всё в сетку
+  document.getElementById('plGrid').innerHTML = `<div class="pl-grid" style="padding-bottom: 20px;">${html}</div>`;
 }
 function addPlaylistUrl(url){
   if(!url) return;
@@ -1056,12 +1127,20 @@ function renderDownloaded(files){
   }
   el.innerHTML=files.map((f,i)=>{
     const isPlaying=S.playerSource==='downloaded'&&S.playerTrackId===f.rel_path;
+
+    // Определяем актуальную иконку
+    let playIcon = '▶';
+    if (isPlaying) {
+      const audio = document.getElementById('audioEl');
+      if (audio && !audio.paused) playIcon = '⏸';
+    }
+
     return `<div class="dl-row${isPlaying?' dl-playing':''}" id="dlrow-${i}">
       <span class="dl-ext">${esc(f.ext)}</span>
       <span class="dl-name" title="${esc(f.path)}">${esc(f.name)}</span>
       <span class="dl-size">${fmtBytes(f.size)}</span>
       <button class="btn sm ghost" onclick="playLocalFile(S.dlFiles[${i}])"
-        title="${isPlaying?'Играет':'Воспроизвести'}">${isPlaying?'⏸':'▶'}</button>
+        title="${isPlaying?'Играет':'Воспроизвести'}">${playIcon}</button>
     </div>`;
   }).join('');
 }

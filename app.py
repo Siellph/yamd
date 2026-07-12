@@ -22,8 +22,6 @@ def main():
     window = webview.create_window(
         title="Yandex Music Downloader",
         url=f"http://127.0.0.1:{SERVER_PORT}/",
-        # html= убран: страница отдаётся Flask-сервером,
-        # поэтому localStorage, cookies и другие browser API работают нормально
         js_api=api,
         width=1020,
         height=720,

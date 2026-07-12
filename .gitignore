@@ -5,3 +5,6 @@ yamd.zip
 .gigacode
 build
 dist
+YMDownloader.spec
+setup_script.iss
+.vscode
