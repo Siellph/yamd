@@ -1,0 +1,7 @@
+__pycache__
+.venv
+config.json
+yamd.zip
+.gigacode
+build
+dist
