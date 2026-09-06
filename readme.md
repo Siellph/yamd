@@ -1,76 +1,63 @@
-# Yandex Music Downloader GUI
+<p align="center">
+  <img src="assets/icon-music.png" width="120" alt="Yandex Music Downloader Logo">
+</p>
 
-Графический интерфейс для скачивания музыки с Яндекс.Музыки.
+<h1 align="center">Yandex Music Downloader GUI</h1>
 
-![Главная](assets/image.png)
+<p align="center">
+  <b>Современный графический интерфейс для скачивания музыки с Яндекс Музыки</b>
+</p>
 
-## Структура проекта
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.9+-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/pywebview-GUI-4B8BBE?style=for-the-badge" alt="pywebview">
+  <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License">
+</p>
 
-```
-├── app.py           — запуск (точка входа)
-├── api.py           — JS-API мост (Python ↔ JS)
-├── ym_client.py     — клиент Яндекс.Музыки (авторизация, треки, превью)
-├── downloader.py    — параллельное скачивание
-├── config.py        — конфиг (config.json)
-├── gui/
-│   └── html.py      — весь HTML/CSS/JS интерфейс
-├── requirements.txt
-└── README.md
-```
+---
 
-## Установка
+<p align="center">
+  <img src="assets/YMDownloader.png" width="85%" alt="Интерфейс приложения">
+</p>
+
+## ✨ Основные возможности
+
+| Функция | Описание |
+| :--- | :--- |
+| **⬇️ Мульти-скачивание** | Загрузка плейлистов, альбомов, отдельных треков и всех дискографий артистов. |
+| **⚡ Высокая скорость** | Параллельная загрузка до 8 треков одновременно (количество потоков настраивается). |
+| **▶️ Встроенный плеер** | Предпросмотр и прослушивание треков перед скачиванием прямо в приложении. |
+| **📋 Личный кабинет** | Быстрый доступ к вашим плейлистам и добавление всей медиатеки в очередь в 1 клик. |
+| **📁 Локальная медиатека** | Просмотр и воспроизведение уже скачанных файлов без сторонних плееров. |
+| **🔑 Безопасный вход** | Удобная авторизация через **OAuth Device Flow** без ручного копирования токенов. |
+
+---
+
+## 🔗 Поддерживаемые ссылки
+
+Приложение автоматически очищает ссылки от `utm`-меток и лишних параметров:
+
+* **Альбом:** `https://music.yandex.ru/album/12345`
+* **Трек:** `https://music.yandex.ru/album/12345/track/67890`
+* **Плейлист:** `https://music.yandex.ru/users/username/playlists/3`
+* **Короткая ссылка:** `https://music.yandex.ru/playlists/lk.UUID`
+* **Исполнитель:** `https://music.yandex.ru/artist/11111`
+
+---
+
+## 🚀 Быстрый старт
+
+### Prerequisites (Требования)
+
+Перед началом убедитесь, что у вас установлен **Python 3.9** или выше.
+
+### 1. Установка зависимостей
 
 ```bash
+# Установка библиотек проекта
 pip install pywebview yandex-music
 
-# yandex-music-downloader
+# Установка консольного загрузчика
 pip install yandex-music-downloader
-# или
-pipx install yandex-music-downloader
-```
-
-На Linux дополнительно:
-```bash
-# Ubuntu/Debian
-sudo apt install python3-gi gir1.2-webkit2-4.1
-```
-
-## Запуск
-
-```bash
-python app.py
-
-# С DevTools:
-python app.py --debug
-```
-
-## Авторизация (автоматически)
-
-1. Нажмите **«Войти»** в шапке приложения
-2. На экране появится код (например `ABC-DEF`)
-3. Откройте ссылку в браузере и введите код
-4. Токен сохраняется автоматически в `config.json`
-
-## Возможности
-
-| Фича | Описание |
-|------|----------|
-| ⬇ Скачивание | Плейлисты, альбомы, треки, артисты |
-| ▶ Превью | Прослушать трек перед скачиванием прямо в приложении |
-| ⚡ Параллельность | До 8 треков одновременно (настраивается) |
-| 📋 Мои плейлисты | Список плейлистов аккаунта, клик → добавить в очередь |
-| 🎵 Скачанные | Просмотр и воспроизведение уже скачанных файлов |
-| 📋 Лог | Скрывается/показывается кнопкой |
-| 🔑 Device Flow | Авторизация без ручного копирования токена |
-
-## Поддерживаемые URL
-
-| Тип | Пример |
-|-----|--------|
-| Альбом | `https://music.yandex.ru/album/12345` |
-| Трек | `https://music.yandex.ru/album/12345/track/67890` |
-| Плейлист | `https://music.yandex.ru/users/username/playlists/3` |
-| Поделиться | `https://music.yandex.ru/playlists/lk.UUID` |
-| Артист | `https://music.yandex.ru/artist/11111` |
-
-UTM-параметры (`?utm_source=...`) обрезаются автоматически.
+# Или через pipx (рекомендуется):
+# pipx install yandex-music-downloader
