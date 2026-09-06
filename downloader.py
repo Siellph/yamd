@@ -45,6 +45,7 @@ class DownloadManager:
     ) -> None:
         self._on_status = on_status
         self._on_log = on_log
+        self._parallel = MAX_PARALLEL
         self._executor = ThreadPoolExecutor(max_workers=MAX_PARALLEL, thread_name_prefix="dl")
         self._futures: dict[str, Future] = {}
         self._lock = threading.Lock()
@@ -53,6 +54,7 @@ class DownloadManager:
 
     def submit(self, tracks: list[dict], cfg: dict) -> None:
         """Ставит треки в очередь. Возвращает сразу."""
+        self._apply_parallel(cfg)
         for track in tracks:
             tid = track["id"]
             with self._lock:
@@ -75,6 +77,28 @@ class DownloadManager:
             return any(not f.done() for f in self._futures.values())
 
     # ── Внутренние методы ─────────────────────────────────────────────────
+
+    def _apply_parallel(self, cfg: dict) -> None:
+        """
+        Подхватывает настройку «Параллельных загрузок» из конфига.
+        Пул нельзя менять на лету, поэтому пересоздаём его только когда
+        очередь пуста — иначе настройка применится к следующей пачке.
+        """
+        try:
+            want = max(1, min(16, int(cfg.get("parallel", MAX_PARALLEL))))
+        except (TypeError, ValueError):
+            return
+
+        with self._lock:
+            if want == self._parallel:
+                return
+            if any(not f.done() for f in self._futures.values()):
+                return
+            old = self._executor
+            self._executor = ThreadPoolExecutor(max_workers=want, thread_name_prefix="dl")
+            self._parallel = want
+            self._futures.clear()
+        old.shutdown(wait=False)
 
     def _download_one(self, track: dict, cfg: dict) -> None:
         tid = track["id"]
