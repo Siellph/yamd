@@ -47,11 +47,11 @@
 
 ## 🚀 Быстрый старт
 
-### Prerequisites (Требования)
+### Требования
 
 Перед началом убедитесь, что у вас установлен **Python 3.9** или выше.
 
-### 1. Установка зависимостей
+### Установка зависимостей
 
 ```bash
 # Установка библиотек проекта
@@ -60,4 +60,5 @@ pip install pywebview yandex-music
 # Установка консольного загрузчика
 pip install yandex-music-downloader
 # Или через pipx (рекомендуется):
-# pipx install yandex-music-downloader
+pipx install yandex-music-downloader
+```
