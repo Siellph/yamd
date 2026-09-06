@@ -32,6 +32,7 @@ def track_to_dict(t, source_url: str, num: int) -> dict:
             "title": "Неизвестный трек",
             "artist": "",
             "album": "",
+            "album_id": None,
             "duration": "—",
             "cover_uri": "",
             "status": "idle",
@@ -39,11 +40,13 @@ def track_to_dict(t, source_url: str, num: int) -> dict:
         }
     artists = ", ".join(a.name for a in (t.artists or []) if a and a.name)
     album = ""
+    album_id = None
     cover_uri = ""
     if t.albums:
         a0 = t.albums[0]
         if a0:
             album = a0.title or ""
+            album_id = a0.id
             if a0.cover_uri:
                 cover_uri = "https://" + a0.cover_uri.replace("%%", "100x100")
     return {
@@ -52,6 +55,7 @@ def track_to_dict(t, source_url: str, num: int) -> dict:
         "title": t.title or "Без названия",
         "artist": artists or "Неизвестный исполнитель",
         "album": album,
+        "album_id": album_id,
         "cover_uri": cover_uri,
         "duration": fmt_duration(t.duration_ms),
         "duration_ms": t.duration_ms or 0,
@@ -286,6 +290,167 @@ class YMClient:
             return [track_to_dict(t, url, i) for i, t in enumerate(result.tracks or [], 1)]
 
         return []
+
+    # ── Поиск треков ───────────────────────────────────────────────────────
+
+    def search_tracks(self, text: str) -> list[dict]:
+        """Полнотекстовый поиск треков в Яндекс.Музыке."""
+        c = self._client
+        if not c:
+            raise RuntimeError("Клиент не инициализирован")
+        result = c.search(text, type_="track")
+        if not result or not result.tracks:
+            return []
+        tracks = result.tracks.results or []
+        return [track_to_dict(t, f"search:{text}", i) for i, t in enumerate(tracks, 1)]
+
+    # ── Моя волна ────────────────────────────────────────────────────────
+
+    WAVE_STATION = "user:onyourwave"
+    WAVE_MAX_REQUESTS = 12  # потолок запросов за один вызов, чтобы не зациклиться
+
+    def _wave_feedback(self, method: str, *args, **kwargs) -> None:
+        """
+        Мягкая обёртка над rotor_station_feedback_* — сигнатуры отличаются
+        между версиями библиотеки, а без обратной связи станция не двигается
+        вперёд и начинает повторять уже выданные треки.
+        """
+        c = self._client
+        fn = getattr(c, method, None)
+        if not fn:
+            return
+        try:
+            fn(*args, **kwargs)
+        except Exception:
+            pass
+
+    def get_wave_tracks(
+        self,
+        seen_ids: list[str] | None = None,
+        target: int = 20,
+        start_num: int = 1,
+    ) -> tuple[list[dict], list[str]]:
+        """
+        Возвращает очередную порцию НОВЫХ треков «Моей волны».
+
+        Как это работает:
+          * `queue` в API — это id ОДНОГО последнего проигранного трека,
+            а не список. Передаём последний известный id.
+          * После каждой порции отправляем station_feedback (trackStarted /
+            trackFinished), иначе станция считает, что треки не прослушаны,
+            и на следующий запрос выдаёт ровно тот же набор.
+          * Всё равно дополнительно фильтруем по seen_ids — сервер иногда
+            повторяет треки даже при корректной обратной связи.
+
+        seen_ids  — id всех треков, уже полученных в текущей сессии волны
+        target    — сколько новых треков набрать (делает несколько запросов подряд)
+        start_num — с какого номера нумеровать треки в списке
+
+        Возвращает (новые_треки, обновлённый_seen_ids).
+        """
+        c = self._client
+        if not c:
+            raise RuntimeError("Клиент не инициализирован")
+
+        seen = list(seen_ids or [])
+        seen_set = set(seen)
+        collected: list[dict] = []
+        requests_made = 0
+        empty_streak = 0
+
+        # Стартуем радио только в самом начале сессии волны
+        if not seen:
+            self._wave_feedback(
+                "rotor_station_feedback_radio_started",
+                self.WAVE_STATION,
+                f"radio-web-{self.WAVE_STATION}",
+            )
+
+        while len(collected) < target and requests_made < self.WAVE_MAX_REQUESTS:
+            requests_made += 1
+            queue = seen[-1] if seen else None
+
+            result = c.rotor_station_tracks(self.WAVE_STATION, queue=queue)
+            if not result or not result.sequence:
+                break
+
+            batch_id = getattr(result, "batch_id", None)
+            got_new = 0
+
+            for item in result.sequence:
+                t = getattr(item, "track", None)
+                if t is None:
+                    continue
+                tid = str(t.id)
+                if tid in seen_set:
+                    continue  # дубликат — пропускаем
+                seen_set.add(tid)
+                seen.append(tid)
+                collected.append(track_to_dict(t, "wave", start_num + len(collected)))
+                got_new += 1
+
+                # Сообщаем станции, что трек прослушан — так она сдвигает поток
+                self._wave_feedback(
+                    "rotor_station_feedback_track_started",
+                    self.WAVE_STATION, tid, batch_id,
+                )
+                self._wave_feedback(
+                    "rotor_station_feedback_track_finished",
+                    self.WAVE_STATION, tid, float(t.duration_ms or 0) / 1000, batch_id,
+                )
+
+                if len(collected) >= target:
+                    break
+
+            if got_new == 0:
+                empty_streak += 1
+                # Две пустые порции подряд — станция исчерпалась, дальше смысла нет
+                if empty_streak >= 2:
+                    break
+            else:
+                empty_streak = 0
+
+        return collected, seen
+
+    # ── Добавление трека в плейлист ─────────────────────────────────────
+
+    def add_track_to_playlist(self, playlist_kind, track_id, album_id) -> bool:
+        """
+        Добавляет трек в начало плейлиста, СОЗДАННОГО самим пользователем.
+        В системные («Мне нравится»), умные (Плейлист дня и т.п.) и чужие
+        плейлисты Яндекс добавлять треки не позволяет.
+        """
+        c = self._client
+        if not c:
+            raise RuntimeError("Клиент не инициализирован")
+
+        kind = int(playlist_kind)
+
+        # Проверяем, что плейлист действительно свой и редактируемый
+        own_kinds = set()
+        try:
+            for pl in (c.users_playlists_list() or []):
+                if pl and pl.kind is not None:
+                    own_kinds.add(int(pl.kind))
+        except Exception as e:
+            raise RuntimeError(f"Не удалось проверить список своих плейлистов: {e}")
+
+        if kind not in own_kinds:
+            raise RuntimeError("В этот плейлист нельзя добавлять треки — он не создан вами")
+
+        uid = c.me.account.uid if c.me and c.me.account else None
+        pl = c.users_playlists(kind, uid) if uid else c.users_playlists(kind)
+        if not pl:
+            raise RuntimeError("Плейлист не найден")
+
+        c.users_playlists_insert_track(
+            kind=kind,
+            track_id=int(track_id),
+            album_id=int(album_id) if album_id else 0,
+            at=0,
+            revision=pl.revision,
+        )
+        return True
 
     # ── Превью / прямая ссылка ────────────────────────────────────────────
 

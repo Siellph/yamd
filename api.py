@@ -160,6 +160,112 @@ class Api:
         self._fetch_thread = threading.Thread(target=_worker, daemon=True)
         self._fetch_thread.start()
 
+    # ── Поиск треков ──────────────────────────────────────────────────────
+
+    def search_tracks(self, query: str) -> None:
+        """Результат → py:search_results."""
+        def _worker():
+            token = self._cfg.get("token", "").strip()
+            if not token or not self._ym.ensure(token):
+                self._emit("search_results", [])
+                self._log("Нет авторизации для поиска", "err")
+                return
+            try:
+                results = self._ym.search_tracks(query)
+                self._emit("search_results", results)
+            except Exception as e:
+                self._log(f"Ошибка поиска: {e}", "err")
+                self._emit("search_results", [])
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ── Открытие плейлиста ────────────────────────────────────────────────
+
+    def open_playlist(self, url: str) -> None:
+        """Загружает треки плейлиста для просмотра. Результат → py:playlist_tracks."""
+        def _worker():
+            token = self._cfg.get("token", "").strip()
+            if not token or not self._ym.ensure(token):
+                self._emit("playlist_tracks", {"url": url, "tracks": []})
+                self._log("Нет авторизации для открытия плейлиста", "err")
+                return
+            try:
+                tracks = self._ym.fetch_tracks(url)
+                self._emit("playlist_tracks", {"url": url, "tracks": tracks})
+            except Exception as e:
+                self._log(f"Ошибка открытия плейлиста: {e}", "err")
+                self._emit("playlist_tracks", {"url": url, "tracks": []})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ── Моя волна ─────────────────────────────────────────────────────────
+
+    def start_wave(self) -> None:
+        """Запускает «Мою волну» с начала. Результат → py:wave_tracks."""
+        def _worker():
+            token = self._cfg.get("token", "").strip()
+            if not token or not self._ym.ensure(token):
+                self._emit("wave_tracks", {"tracks": [], "seen": [], "append": False})
+                self._log("Нет авторизации для запуска волны", "err")
+                return
+            try:
+                tracks, seen = self._ym.get_wave_tracks(target=30, start_num=1)
+                self._emit("wave_tracks", {"tracks": tracks, "seen": seen, "append": False})
+                self._log(f"🌊 Волна запущена: {len(tracks)} трек(ов)", "ok")
+            except Exception as e:
+                self._log(f"Ошибка запуска волны: {e}", "err")
+                self._emit("wave_tracks", {"tracks": [], "seen": [], "append": False})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def wave_next(self, seen_ids: list[str], start_num: int = 1) -> None:
+        """Подгружает следующую порцию треков волны. Результат → py:wave_tracks (append)."""
+        def _worker():
+            token = self._cfg.get("token", "").strip()
+            if not token or not self._ym.ensure(token):
+                self._emit("wave_tracks", {"tracks": [], "seen": seen_ids or [], "append": True})
+                return
+            try:
+                tracks, seen = self._ym.get_wave_tracks(
+                    seen_ids=seen_ids, target=30, start_num=start_num
+                )
+                self._emit("wave_tracks", {"tracks": tracks, "seen": seen, "append": True})
+                if tracks:
+                    self._log(f"🌊 Добавлено {len(tracks)} новых трек(ов)", "ok")
+                else:
+                    self._log("🌊 Волна больше не выдаёт новых треков", "err")
+            except Exception as e:
+                self._log(f"Ошибка загрузки волны: {e}", "err")
+                self._emit("wave_tracks", {"tracks": [], "seen": seen_ids or [], "append": True})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ── Добавление трека в плейлист ───────────────────────────────────────
+
+    def add_to_playlist(self, playlist_id: str, track_id: str, album_id: Optional[str]) -> None:
+        """Результат → py:add_to_playlist_result."""
+        def _worker():
+            token = self._cfg.get("token", "").strip()
+            if not token or not self._ym.ensure(token):
+                self._emit("add_to_playlist_result", {
+                    "ok": False, "track_id": track_id, "playlist_id": playlist_id,
+                    "msg": "Нет авторизации",
+                })
+                return
+            try:
+                self._ym.add_track_to_playlist(playlist_id, track_id, album_id)
+                self._emit("add_to_playlist_result", {
+                    "ok": True, "track_id": track_id, "playlist_id": playlist_id, "msg": "",
+                })
+                self._log("✓ Трек добавлен в плейлист", "ok")
+            except Exception as e:
+                self._emit("add_to_playlist_result", {
+                    "ok": False, "track_id": track_id, "playlist_id": playlist_id, "msg": str(e),
+                })
+                self._log(f"✗ Не удалось добавить трек в плейлист: {e}", "err")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     # ── Скачивание ────────────────────────────────────────────────────────
 
     def start_download(self, tracks: list[dict]) -> bool:
