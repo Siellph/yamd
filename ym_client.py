@@ -35,6 +35,7 @@ def track_to_dict(t, source_url: str, num: int) -> dict:
             "album_id": None,
             "duration": "—",
             "cover_uri": "",
+            "cover_uri_tmpl": "",
             "status": "idle",
             "source_url": source_url,
         }
@@ -42,13 +43,15 @@ def track_to_dict(t, source_url: str, num: int) -> dict:
     album = ""
     album_id = None
     cover_uri = ""
+    cover_uri_tmpl = ""
     if t.albums:
         a0 = t.albums[0]
         if a0:
             album = a0.title or ""
             album_id = a0.id
             if a0.cover_uri:
-                cover_uri = "https://" + a0.cover_uri.replace("%%", "100x100")
+                cover_uri_tmpl = "https://" + a0.cover_uri
+                cover_uri = cover_uri_tmpl.replace("%%", "100x100")
     return {
         "id": str(t.id),
         "num": num,
@@ -57,6 +60,7 @@ def track_to_dict(t, source_url: str, num: int) -> dict:
         "album": album,
         "album_id": album_id,
         "cover_uri": cover_uri,
+        "cover_uri_tmpl": cover_uri_tmpl,
         "duration": fmt_duration(t.duration_ms),
         "duration_ms": t.duration_ms or 0,
         "status": "idle",
@@ -324,6 +328,16 @@ class YMClient:
         except Exception:
             pass
 
+    def _wave_feedback_async(self, method: str, *args, **kwargs) -> None:
+        """
+        Как _wave_feedback, но не блокирует сбор треков: trackStarted/trackFinished
+        не нужны станции немедленно, а ждать их ответа синхронно — то, из-за чего
+        загрузка волны занимала секунды на каждую порцию треков.
+        """
+        threading.Thread(
+            target=self._wave_feedback, args=(method, *args), kwargs=kwargs, daemon=True
+        ).start()
+
     def get_wave_tracks(
         self,
         seen_ids: list[str] | None = None,
@@ -389,12 +403,13 @@ class YMClient:
                 collected.append(track_to_dict(t, "wave", start_num + len(collected)))
                 got_new += 1
 
-                # Сообщаем станции, что трек прослушан — так она сдвигает поток
-                self._wave_feedback(
+                # Сообщаем станции, что трек прослушан — так она сдвигает поток.
+                # Асинхронно: ответ станции не нужен, чтобы продолжить сбор треков.
+                self._wave_feedback_async(
                     "rotor_station_feedback_track_started",
                     self.WAVE_STATION, tid, batch_id,
                 )
-                self._wave_feedback(
+                self._wave_feedback_async(
                     "rotor_station_feedback_track_finished",
                     self.WAVE_STATION, tid, float(t.duration_ms or 0) / 1000, batch_id,
                 )
@@ -451,6 +466,48 @@ class YMClient:
             revision=pl.revision,
         )
         return True
+
+    # ── Лайки ("Мне нравится") ───────────────────────────────────────────
+
+    def get_liked_track_ids(self) -> list[str]:
+        """Id всех треков, отмеченных «Мне нравится»."""
+        c = self._client
+        if not c:
+            return []
+        likes = c.users_likes_tracks()
+        if not likes:
+            return []
+        # Не likes.tracks_ids — там id в виде "trackId:albumId" (TrackShort.track_id),
+        # а весь остальной код (превью, скачивание, сердечки в списках) сверяется
+        # по чистому numeric id (TrackShort.id), из-за чего лайки нигде не совпадали.
+        return [str(t.id) for t in likes.tracks]
+
+    def set_track_liked(self, track_id: str, liked: bool) -> bool:
+        """Ставит/снимает отметку «Мне нравится» треку."""
+        c = self._client
+        if not c:
+            raise RuntimeError("Клиент не инициализирован")
+        if liked:
+            return bool(c.users_likes_tracks_add(track_id))
+        return bool(c.users_likes_tracks_remove(track_id))
+
+    # ── Текст песни ───────────────────────────────────────────────────────
+
+    def get_lyrics(self, track_id: str) -> str | None:
+        """Текст песни (обычный, без таймкодов). None — если недоступен."""
+        c = self._client
+        if not c:
+            raise RuntimeError("Клиент не инициализирован")
+        try:
+            lyrics = c.tracks_lyrics(track_id, format_="TEXT")
+        except Exception:
+            return None
+        if not lyrics:
+            return None
+        try:
+            return lyrics.fetch_lyrics()
+        except Exception:
+            return None
 
     # ── Превью / прямая ссылка ────────────────────────────────────────────
 

@@ -209,7 +209,7 @@ class Api:
                 self._log("Нет авторизации для запуска волны", "err")
                 return
             try:
-                tracks, seen = self._ym.get_wave_tracks(target=30, start_num=1)
+                tracks, seen = self._ym.get_wave_tracks(target=10, start_num=1)
                 self._emit("wave_tracks", {"tracks": tracks, "seen": seen, "append": False})
                 self._log(f"🌊 Волна запущена: {len(tracks)} трек(ов)", "ok")
             except Exception as e:
@@ -227,7 +227,7 @@ class Api:
                 return
             try:
                 tracks, seen = self._ym.get_wave_tracks(
-                    seen_ids=seen_ids, target=30, start_num=start_num
+                    seen_ids=seen_ids, target=15, start_num=start_num
                 )
                 self._emit("wave_tracks", {"tracks": tracks, "seen": seen, "append": True})
                 if tracks:
@@ -263,6 +263,64 @@ class Api:
                     "ok": False, "track_id": track_id, "playlist_id": playlist_id, "msg": str(e),
                 })
                 self._log(f"✗ Не удалось добавить трек в плейлист: {e}", "err")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ── Лайки ("Мне нравится") ──────────────────────────────────────────────
+
+    def get_liked_ids(self) -> None:
+        """Id всех лайкнутых треков → py:liked_ids."""
+        def _worker():
+            token = self._cfg.get("token", "").strip()
+            if not token or not self._ym.ensure(token):
+                self._emit("liked_ids", [])
+                return
+            try:
+                ids = self._ym.get_liked_track_ids()
+                self._emit("liked_ids", ids)
+            except Exception as e:
+                self._log(f"Ошибка загрузки лайков: {e}", "err")
+                self._emit("liked_ids", [])
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def toggle_like(self, track_id: str, liked: bool) -> None:
+        """Результат → py:like_result."""
+        def _worker():
+            token = self._cfg.get("token", "").strip()
+            if not token or not self._ym.ensure(token):
+                self._emit("like_result", {
+                    "track_id": track_id, "liked": not liked, "ok": False, "msg": "Нет авторизации",
+                })
+                return
+            try:
+                self._ym.set_track_liked(track_id, liked)
+                self._emit("like_result", {
+                    "track_id": track_id, "liked": liked, "ok": True, "msg": "",
+                })
+            except Exception as e:
+                self._emit("like_result", {
+                    "track_id": track_id, "liked": not liked, "ok": False, "msg": str(e),
+                })
+                self._log(f"✗ Не удалось изменить лайк: {e}", "err")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ── Текст песни ──────────────────────────────────────────────────────────
+
+    def get_lyrics(self, track_id: str) -> None:
+        """Результат → py:lyrics_result."""
+        def _worker():
+            token = self._cfg.get("token", "").strip()
+            if not token or not self._ym.ensure(token):
+                self._emit("lyrics_result", {"track_id": track_id, "text": None})
+                return
+            try:
+                text = self._ym.get_lyrics(track_id)
+                self._emit("lyrics_result", {"track_id": track_id, "text": text})
+            except Exception as e:
+                self._log(f"Ошибка загрузки текста песни: {e}", "err")
+                self._emit("lyrics_result", {"track_id": track_id, "text": None})
 
         threading.Thread(target=_worker, daemon=True).start()
 

@@ -25,6 +25,12 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;font-size:13px;
   background:var(--bg);color:var(--text);display:flex;flex-direction:column;
   height:100vh;user-select:none;-webkit-user-select:none;}
 
+/* ── Общие анимации ── */
+@keyframes fadeInUp{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:translateY(0);}}
+@keyframes popIn{0%{transform:scale(1);}40%{transform:scale(1.35);}100%{transform:scale(1);}}
+.fade-in{animation:fadeInUp .22s cubic-bezier(.16,1,.3,1);}
+.pop{animation:popIn .32s cubic-bezier(.34,1.56,.64,1);}
+
 /* ── Titlebar ── */
 .titlebar{display:flex;align-items:center;gap:10px;padding:10px 16px;
   background:var(--surface);border-bottom:1px solid var(--border);
@@ -52,7 +58,7 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;font-size:13px;
 /* ── Main / Pages ── */
 .main{flex:1;display:flex;flex-direction:column;overflow:hidden;}
 .page{display:none;flex-direction:column;flex:1;overflow:hidden;padding:16px 18px;gap:12px;}
-.page.active{display:flex;}
+.page.active{display:flex;animation:fadeInUp .22s cubic-bezier(.16,1,.3,1);}
 #page-settings,#page-downloaded{overflow-y:auto;}
 
 /* ── Controls ── */
@@ -139,6 +145,8 @@ select option{background:var(--surface2);}
 .iBtn.playing{background:var(--blue-dim);color:var(--blue);border-color:var(--blue);}
 .iBtn.done{color:var(--green);border-color:rgba(74,222,128,.4);background:var(--green-dim);}
 .iBtn.error{color:var(--red);border-color:rgba(248,113,113,.4);background:var(--red-dim);}
+.like-btn.liked{color:var(--red);border-color:rgba(248,113,113,.4);background:var(--red-dim);}
+.like-btn.liked:hover{background:var(--red);color:#fff;}
 
 /* ── Empty State ── */
 .empty{flex:1;display:flex;flex-direction:column;align-items:center;
@@ -167,7 +175,8 @@ select option{background:var(--surface2);}
   background:var(--surface);border-top:1px solid var(--border);flex-shrink:0;}
 .player.hidden{display:none;}
 .player-cover{width:36px;height:36px;border-radius:4px;object-fit:cover;
-  background:var(--surface2);flex-shrink:0;}
+  background:var(--surface2);flex-shrink:0;cursor:pointer;transition:transform .15s;}
+.player-cover:hover{transform:scale(1.08);}
 .player-info{min-width:0;width:180px;flex-shrink:0;}
 .player-title{font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13px;}
 .player-artist{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
@@ -176,6 +185,29 @@ select option{background:var(--surface2);}
 .player-seek{flex:1;accent-color:var(--accent);cursor:pointer;height:4px;min-width:60px;}
 .player-mode{display:flex;align-items:center;gap:4px;flex-shrink:0;}
 audio{display:none;}
+
+/* ── Полноэкранный просмотр трека ── */
+.bigview{position:fixed;inset:0;z-index:400;display:flex;flex-direction:column;
+  background:var(--bg);opacity:0;pointer-events:none;transition:opacity .2s ease;}
+.bigview.show{opacity:1;pointer-events:auto;}
+.bigview.hidden{display:none;}
+.bigview-bg{position:absolute;inset:0;background-size:cover;background-position:center;
+  filter:blur(60px) brightness(.4);transform:scale(1.2);}
+.bigview-top{position:relative;display:flex;justify-content:flex-end;padding:14px 18px;flex-shrink:0;}
+.bigview-body{position:relative;flex:1;display:flex;gap:36px;padding:0 48px 36px;overflow:hidden;
+  align-items:stretch;}
+.bigview-cover{width:min(340px,32vw);height:min(340px,32vw);flex-shrink:0;border-radius:14px;
+  object-fit:cover;background:var(--surface2);box-shadow:0 20px 60px rgba(0,0,0,.5);align-self:center;}
+.bigview-info{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden;}
+.bigview-title{font-size:26px;font-weight:700;margin-bottom:6px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.bigview-artist{font-size:15px;color:var(--muted);margin-bottom:2px;}
+.bigview-album{font-size:13px;color:var(--hint);margin-bottom:16px;}
+.bigview-actions{display:flex;gap:8px;margin-bottom:18px;}
+.bigview-lyrics-wrap{flex:1;overflow-y:auto;border-top:1px solid var(--border);padding-top:16px;}
+.bigview-lyrics{white-space:pre-wrap;line-height:1.9;font-size:14px;color:var(--text);
+  max-width:640px;}
+.bigview-lyrics.muted{color:var(--hint);font-style:italic;white-space:normal;}
 
 /* ── Auth Modal ── */
 .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.75);
@@ -237,9 +269,10 @@ audio{display:none;}
 .pl-count{font-size:11px;color:var(--muted);margin-top:2px;}
 
 /* ── Extra track rows (search / wave / playlist detail) ── */
-.ex-row{display:grid;grid-template-columns:24px 1fr 150px 64px 28px 28px 28px;
+.ex-row{display:grid;grid-template-columns:24px 1fr 150px 64px 28px 28px 28px 28px;
   gap:6px;padding:8px 10px;align-items:center;
-  border-bottom:1px solid var(--border);transition:background .1s;}
+  border-bottom:1px solid var(--border);transition:background .18s ease;}
+.ex-row.selectable{grid-template-columns:18px 24px 1fr 150px 64px 28px 28px 28px 28px;}
 .ex-row:last-child{border-bottom:none;}
 .ex-row:hover{background:var(--surface2);}
 .ex-row.downloading{background:var(--blue-dim);}
@@ -452,7 +485,10 @@ audio{display:none;}
           <span id="waveCount" style="font-size:12px;color:var(--muted)"></span>
           <div class="toolbar-right">
             <button class="btn sm" onclick="resetWave()" title="Начать волну заново">↻ Заново</button>
+            <button class="btn sm" onclick="waveSelectAll(true)">☑ Все</button>
+            <button class="btn sm" onclick="waveSelectAll(false)">☐ Снять</button>
             <button class="btn sm" id="btnWaveMore" onclick="loadMoreWave()">▶ Ещё треки</button>
+            <button class="btn sm accent" id="btnWaveDownloadSel" onclick="downloadSelectedWave()" style="display:none">⬇ Скачать выбранные</button>
             <button class="btn accent sm" onclick="downloadAllWave()">⬇ Скачать все</button>
           </div>
         </div>
@@ -599,11 +635,12 @@ audio{display:none;}
 
 <!-- ══ Mini Player ══ -->
 <div class="player hidden" id="player">
-  <img class="player-cover" id="plCover" src="" alt="" style="display:none">
+  <img class="player-cover" id="plCover" src="" alt="" style="display:none" onclick="openBigView()" title="Развернуть">
   <div class="player-info">
     <div class="player-title" id="plTitle">—</div>
     <div class="player-artist" id="plArtist">—</div>
   </div>
+  <button class="iBtn like-btn" id="plLikeBtn" onclick="toggleLikeCurrent()" title="Мне нравится">♡</button>
   <div class="player-controls">
     <button class="btn sm ghost" onclick="playerPrev()" title="Предыдущий трек">⏮</button>
     <button class="btn sm ghost" onclick="playerSkip(-10)" title="-10 сек">«10</button>
@@ -626,6 +663,31 @@ audio{display:none;}
     ontimeupdate="playerTimeUpdate()"
     oncanplay="playerCanPlay()"
     onerror="playerError()"></audio>
+</div>
+
+<!-- ══ Полноэкранный просмотр трека ══ -->
+<div class="bigview hidden" id="bigView">
+  <div class="bigview-bg" id="bigViewBg"></div>
+  <div class="bigview-top">
+    <button class="btn sm ghost" onclick="closeBigView()" title="Свернуть">✕ Свернуть</button>
+  </div>
+  <div class="bigview-body">
+    <img class="bigview-cover" id="bigViewCover" src="" alt="">
+    <div class="bigview-info">
+      <div class="bigview-title" id="bigViewTitle">—</div>
+      <div class="bigview-artist" id="bigViewArtist">—</div>
+      <div class="bigview-album" id="bigViewAlbum"></div>
+      <div class="bigview-actions">
+        <button class="btn sm ghost" onclick="playerPrev()" title="Предыдущий трек">⏮</button>
+        <button class="btn sm accent" id="bigViewPlayBtn" onclick="playerToggle()">▶</button>
+        <button class="btn sm ghost" onclick="playerNext()" title="Следующий трек">⏭</button>
+        <button class="iBtn like-btn" id="bigViewLikeBtn" onclick="toggleLikeCurrent()" title="Мне нравится">♡</button>
+      </div>
+      <div class="bigview-lyrics-wrap">
+        <div class="bigview-lyrics muted" id="bigViewLyrics">Текст песни не загружен</div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -683,8 +745,14 @@ const S = {
   waveTracks: [],
   waveSeenIds: [],
   waveLoading: false,
+  waveSelected: new Set(),
   pendingAdds: {},
   searchDone: false,
+  // лайки / полноэкранный просмотр
+  likedIds: new Set(),
+  likedPending: new Set(),
+  lyricsCache: {},
+  bigViewOpen: false,
 };
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -794,6 +862,8 @@ window.addEventListener('py:auth_done', e=>{
   document.getElementById('cfgToken').value=e.detail.token;
   document.getElementById('authInfo').textContent='✓ Авторизован';
   document.getElementById('btnLogin').textContent='⚙ Аккаунт';
+  window.pywebview.api.get_my_playlists();
+  window.pywebview.api.get_liked_ids();
 });
 
 window.addEventListener('py:auth_error', e=>{
@@ -1020,7 +1090,115 @@ function _rerenderActive(){
   renderSearchResults();
   if(S.plView==='detail') renderPlaylistDetail();
   if(S.plView==='wave') renderWave();
+  _updateLikeButtons();
+  if(S.bigViewOpen) _fillBigView();
 }
+
+/* ── Лайки ("Мне нравится") ── */
+function _currentPlayingTrack(){
+  if(S.playerSource==='downloaded' || !S.playerSource || !S.playerTrackId) return null;
+  return _listFor(S.playerSource).find(x=>x.id===S.playerTrackId) || null;
+}
+function _updateLikeButtons(){
+  const t=_currentPlayingTrack();
+  const liked=!!(t && S.likedIds.has(t.id));
+  [document.getElementById('plLikeBtn'), document.getElementById('bigViewLikeBtn')].forEach(btn=>{
+    if(!btn) return;
+    btn.classList.toggle('liked', liked);
+    btn.textContent=liked?'♥':'♡';
+    btn.style.visibility=t?'':'hidden';
+  });
+}
+function toggleLike(source,id){
+  const list=_listFor(source);
+  const t=list.find(x=>x.id===id);
+  if(!t || S.likedPending.has(id)) return;
+  const nextLiked=!S.likedIds.has(id);
+  S.likedPending.add(id);
+  if(nextLiked) S.likedIds.add(id); else S.likedIds.delete(id);
+  _updateExRow(source,id);
+  _updateLikeButtons();
+  window.pywebview.api.toggle_like(id, nextLiked);
+}
+function toggleLikeCurrent(){
+  const t=_currentPlayingTrack();
+  if(!t) return;
+  toggleLike(S.playerSource, t.id);
+}
+window.addEventListener('py:liked_ids', e=>{
+  S.likedIds = new Set(e.detail || []);
+  _rerenderActive();
+});
+window.addEventListener('py:like_result', e=>{
+  const{track_id,liked,ok,msg}=e.detail;
+  S.likedPending.delete(track_id);
+  if(liked) S.likedIds.add(track_id); else S.likedIds.delete(track_id);
+  ['search','wave','playlist_detail'].forEach(src=>_updateExRow(src,track_id));
+  _updateLikeButtons();
+  if(!ok) addLog(`✗ Не удалось изменить лайк: ${msg||''}`,'err');
+});
+
+/* ── Полноэкранный просмотр обложки / текста песни ── */
+function _bigCoverUrl(t,size){
+  if(t.cover_uri_tmpl) return t.cover_uri_tmpl.replace('%%', size);
+  return t.cover_uri || '';
+}
+function openBigView(){
+  const t=_currentPlayingTrack();
+  if(!t) return;
+  S.bigViewOpen=true;
+  document.getElementById('bigView').classList.remove('hidden');
+  requestAnimationFrame(()=>document.getElementById('bigView').classList.add('show'));
+  _fillBigView();
+}
+function closeBigView(){
+  S.bigViewOpen=false;
+  const el=document.getElementById('bigView');
+  el.classList.remove('show');
+  setTimeout(()=>el.classList.add('hidden'),200);
+}
+function _fillBigView(){
+  const t=_currentPlayingTrack();
+  if(!t){ closeBigView(); return; }
+  const big=_bigCoverUrl(t,'600x600')||'';
+  document.getElementById('bigViewCover').src=big;
+  document.getElementById('bigViewBg').style.backgroundImage=big?`url('${big}')`:'none';
+  document.getElementById('bigViewTitle').textContent=t.title||'—';
+  document.getElementById('bigViewArtist').textContent=t.artist||'';
+  document.getElementById('bigViewAlbum').textContent=t.album||'';
+  _updatePlayBtn();
+  _loadLyricsFor(t.id);
+}
+function _loadLyricsFor(trackId){
+  const box=document.getElementById('bigViewLyrics');
+  if(!box) return;
+  if(Object.prototype.hasOwnProperty.call(S.lyricsCache,trackId)){
+    _renderLyrics(trackId);
+    return;
+  }
+  box.className='bigview-lyrics muted';
+  box.textContent='Загружаем текст...';
+  window.pywebview.api.get_lyrics(trackId);
+}
+function _renderLyrics(trackId){
+  const box=document.getElementById('bigViewLyrics');
+  if(!box || !S.bigViewOpen) return;
+  const t=_currentPlayingTrack();
+  if(!t || t.id!==trackId) return; // трек уже сменился — не показываем чужой текст
+  const text=S.lyricsCache[trackId];
+  if(text){
+    box.className='bigview-lyrics';
+    box.textContent=text;
+  } else {
+    box.className='bigview-lyrics muted';
+    box.textContent='Текст песни недоступен для этого трека';
+  }
+}
+window.addEventListener('py:lyrics_result', e=>{
+  const{track_id,text}=e.detail;
+  S.lyricsCache[track_id]=text||null;
+  _renderLyrics(track_id);
+});
 
 /* ── Универсальные превью / скачивание для поиска / волны / плейлиста ── */
 function previewGeneric(source,id){
@@ -1066,7 +1244,14 @@ function exRowHTML(t,source){
   const dlIcon={idle:'⬇',queued:'⏳',downloading:'⏳',done:'✓',error:'↺'}[st]||'⬇';
   const dlCls={done:'done',error:'error'}[st]||'';
   const dlDis=(st==='downloading'||st==='queued')?'disabled':'';
-  return `<div class="ex-row ${st}" id="exrow-${source}-${t.id}">
+  const liked=S.likedIds.has(t.id);
+  const likeCls=liked?'liked':'';
+  const selectable=source==='wave';
+  const cbHtml=selectable
+    ?`<input type="checkbox" class="cb" ${S.waveSelected.has(t.id)?'checked':''} onchange="toggleWaveSelect('${t.id}',this.checked)">`
+    :'';
+  return `<div class="ex-row ${selectable?'selectable':''} ${st}" id="exrow-${source}-${t.id}">
+    ${cbHtml}
     <span class="tl-num">${t.num||''}</span>
     <div style="min-width:0">
       <div class="tl-title" title="${esc(t.title)}">${esc(t.title)}</div>
@@ -1075,6 +1260,7 @@ function exRowHTML(t,source){
     <div class="tl-album" title="${esc(t.album)}">${esc(t.album)}</div>
     <span class="tl-dur">${t.duration||''}</span>
     <button class="iBtn ${prvCls}" title="Прослушать" onclick="previewGeneric('${source}','${t.id}')">${playIcon}</button>
+    <button class="iBtn like-btn ${likeCls}" title="Мне нравится" onclick="toggleLike('${source}','${t.id}')">${liked?'♥':'♡'}</button>
     <button class="iBtn" title="Добавить в плейлист" onclick="toggleAddMenu(event,'${source}','${t.id}')">➕</button>
     <button class="iBtn ${dlCls}" ${dlDis} title="Скачать" onclick="downloadGeneric('${source}','${t.id}')">${dlIcon}</button>
   </div>`;
@@ -1296,6 +1482,7 @@ function playerClose(){
   a.pause(); a.src='';
   document.getElementById('player').classList.add('hidden');
   S.playerTrackId=null;
+  closeBigView();
   renderTracks();
   renderDownloaded(S.dlFiles);
 }
@@ -1310,6 +1497,8 @@ function _updatePlayBtn(){
   const audio = document.getElementById('audioEl');
   const paused = audio ? audio.paused : true;
   document.getElementById('plPlayBtn').textContent = paused ? '▶' : '⏸';
+  const bigBtn=document.getElementById('bigViewPlayBtn');
+  if(bigBtn) bigBtn.textContent = paused ? '▶' : '⏸';
 
   // Обновляем иконку в основном списке треков
   if (S.playerSource === 'tracks' && S.playerTrackId) {
@@ -1360,11 +1549,25 @@ function _applyModeUI(){
 /* ═══════════════════════════════════════════════════════════════════
    MY PLAYLISTS
 ═══════════════════════════════════════════════════════════════════ */
+/* Переключение между сеткой плейлистов / деталями / волной с плавным появлением */
+function _showPlSubView(which){
+  const map={grid:'plGridWrap', detail:'plDetailWrap', wave:'plWaveWrap'};
+  Object.entries(map).forEach(([key,id])=>{
+    const el=document.getElementById(id);
+    if(!el) return;
+    if(key===which){
+      el.style.display='flex';
+      el.classList.remove('fade-in');
+      void el.offsetWidth; // форсируем reflow, чтобы анимация перезапустилась
+      el.classList.add('fade-in');
+    } else {
+      el.style.display='none';
+    }
+  });
+}
 function openPlaylistsList(){
   S.plView='grid';
-  document.getElementById('plGridWrap').style.display='flex';
-  document.getElementById('plDetailWrap').style.display='none';
-  document.getElementById('plWaveWrap').style.display='none';
+  _showPlSubView('grid');
   loadMyPlaylists();
 }
 function loadMyPlaylists(){
@@ -1488,6 +1691,7 @@ function openWave(){
   if(!S.waveTracks.length){
     document.getElementById('waveBody').innerHTML=`<div class="empty"><span class="empty-icon">⏳</span><p>Запускаем волну...</p></div>`;
     S.waveSeenIds=[];
+    S.waveSelected=new Set();
     S.waveLoading=true;
     _updateWaveBtns();
     window.pywebview.api.start_wave();
@@ -1510,6 +1714,7 @@ function loadMoreWave(){
 function resetWave(){
   S.waveTracks=[];
   S.waveSeenIds=[];
+  S.waveSelected=new Set();
   S.waveLoading=true;
   _updateWaveBtns();
   document.getElementById('waveBody').innerHTML=`<div class="empty"><span class="empty-icon">⏳</span><p>Перезапускаем волну...</p></div>`;
@@ -1560,6 +1765,7 @@ function renderWave(){
       </div>`;
   body.scrollTop=keepScroll;  // не теряем позицию при подгрузке
   _updateWaveBtns();
+  _updateWaveSelUI();
   // Автоподгрузка при прокрутке до конца списка
   if(!body.dataset.scrollBound){
     body.dataset.scrollBound='1';
@@ -1575,6 +1781,32 @@ function downloadAllWave(){
   S.waveTracks.forEach(t=>{ if(t.status!=='done') t.status='queued'; });
   renderWave();
   addLog(`В очереди: ${S.waveTracks.length} треков из волны`,'info');
+}
+
+/* ── Выбор треков волны для скачивания ── */
+function toggleWaveSelect(id,checked){
+  if(checked) S.waveSelected.add(id); else S.waveSelected.delete(id);
+  _updateWaveSelUI();
+}
+function waveSelectAll(v){
+  S.waveSelected = v ? new Set(S.waveTracks.map(t=>t.id)) : new Set();
+  renderWave();
+}
+function _updateWaveSelUI(){
+  const btn=document.getElementById('btnWaveDownloadSel');
+  if(!btn) return;
+  const n=S.waveSelected.size;
+  btn.style.display = n>0 ? '' : 'none';
+  btn.textContent = `⬇ Скачать выбранные (${n})`;
+}
+function downloadSelectedWave(){
+  const tracks=S.waveTracks.filter(t=>S.waveSelected.has(t.id));
+  if(!tracks.length) return;
+  window.pywebview.api.start_download(tracks);
+  tracks.forEach(t=>{ if(t.status!=='done') t.status='queued'; });
+  S.waveSelected=new Set();
+  renderWave();
+  addLog(`В очереди: ${tracks.length} выбранных трек(ов) из волны`,'info');
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1713,7 +1945,10 @@ window.addEventListener('pywebviewready',async ()=>{
   const cfg=await loadSettings();
   // Подтянуть список плейлистов заранее — он нужен для кнопки «добавить в плейлист»,
   // но только если уже есть токен, иначе получим лишнюю ошибку в логе
-  if(cfg && cfg.token) window.pywebview.api.get_my_playlists();
+  if(cfg && cfg.token){
+    window.pywebview.api.get_my_playlists();
+    window.pywebview.api.get_liked_ids();
+  }
   addLog('Приложение готово к работе','info');
 });
 </script>
