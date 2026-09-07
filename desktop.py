@@ -3,6 +3,9 @@
 
 Закрытие окна скрывает его в трей (hide в отдельном потоке — иначе pywebview
 зависает). Выход только из меню трея: flush_last_play без evaluate_js.
+
+Один процесс на сессию: именованный мьютекс Local\\YaMD.* и событие
+восстановления окна (второй запуск только сигналит и сразу выходит).
 """
 from __future__ import annotations
 
@@ -12,6 +15,106 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
+
+
+# Уникально для YaMD — не «python» и не имя exe. Одинаково для python app.py и frozen exe.
+_MUTEX_NAME = "Local\\YaMD.YandexMusicDownloader.SingleInstance"
+_EVENT_NAME = "Local\\YaMD.YandexMusicDownloader.RestoreWindow"
+
+_ERROR_ALREADY_EXISTS = 183
+_EVENT_MODIFY_STATE = 0x0002
+_WAIT_OBJECT_0 = 0
+
+# Держим хэндлы до конца процесса: закрытый мьютекс снова можно захватить.
+_single_mutex = None
+_single_event = None
+_k32 = None
+_k32_lock = threading.Lock()
+
+
+def _as_handle(value):
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value or None
+    raw = getattr(value, "value", None)
+    return raw or None
+
+
+def _kernel32():
+    global _k32
+    if _k32 is not None:
+        return _k32
+
+    import ctypes
+    from ctypes import wintypes
+
+    with _k32_lock:
+        if _k32 is not None:
+            return _k32
+        # HANDLE как c_size_t: c_void_p restype на 64-bit иногда отдаёт 0/None.
+        handle_t = ctypes.c_size_t
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        k.CreateMutexW.restype = handle_t
+        k.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+        k.CreateEventW.restype = handle_t
+        k.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        k.OpenEventW.restype = handle_t
+        k.SetEvent.argtypes = [handle_t]
+        k.SetEvent.restype = wintypes.BOOL
+        k.ResetEvent.argtypes = [handle_t]
+        k.ResetEvent.restype = wintypes.BOOL
+        k.WaitForSingleObject.argtypes = [handle_t, wintypes.DWORD]
+        k.WaitForSingleObject.restype = wintypes.DWORD
+        k.CloseHandle.argtypes = [handle_t]
+        k.CloseHandle.restype = wintypes.BOOL
+        _k32 = k
+        return k
+
+
+def _signal_existing_instance() -> None:
+    """Просим уже запущенный процесс показать окно (тот же путь, что «Показать» в трее)."""
+    k = _kernel32()
+    handle = None
+    for _ in range(20):
+        handle = _as_handle(k.OpenEventW(_EVENT_MODIFY_STATE, False, _EVENT_NAME))
+        if handle:
+            break
+        time.sleep(0.05)
+    if not handle:
+        return
+    try:
+        k.SetEvent(handle)
+    finally:
+        k.CloseHandle(handle)
+
+
+def claim_single_instance() -> bool:
+    """
+    True — этот процесс единственный, можно создавать окно/трей/хук.
+    False — другой YaMD уже жив: ему послали restore, этот процесс должен сразу выйти.
+    """
+    global _single_mutex, _single_event
+
+    if sys.platform != "win32":
+        return True
+
+    import ctypes
+
+    k = _kernel32()
+    mutex = _as_handle(k.CreateMutexW(None, True, _MUTEX_NAME))
+    if not mutex:
+        return True
+
+    if ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
+        k.CloseHandle(mutex)
+        _signal_existing_instance()
+        return False
+
+    _single_mutex = mutex
+    _single_event = _as_handle(k.CreateEventW(None, True, False, _EVENT_NAME))
+    return True
 
 
 _WV2_KEEPALIVE = (
@@ -85,12 +188,15 @@ class DesktopHost:
         self._icon = None
         self._tray_thread: Optional[threading.Thread] = None
         self._media: Optional[_WinMediaKeys] = None
+        self._restore_stop = threading.Event()
+        self._restore_thread: Optional[threading.Thread] = None
         self._invoke_lock = threading.Lock()
         self._last_invoke = 0.0
 
     def attach(self) -> None:
         self._start_tray()
         self._start_media_keys()
+        self._start_restore_watcher()
         try:
             self.window.events.closing += self.on_closing
         except Exception:
@@ -131,6 +237,7 @@ class DesktopHost:
             return
         self.exit_requested = True
         self.api.flush_last_play()
+        self._stop_restore_watcher()
         self.stop_media_keys()
         icon = self._icon
         self._icon = None
@@ -147,6 +254,7 @@ class DesktopHost:
     def shutdown(self) -> None:
         self.exit_requested = True
         self.api.flush_last_play()
+        self._stop_restore_watcher()
         self.stop_media_keys()
         icon = self._icon
         self._icon = None
@@ -211,6 +319,36 @@ class DesktopHost:
         if self._media:
             self._media.stop()
             self._media = None
+
+    def _start_restore_watcher(self) -> None:
+        if sys.platform != "win32" or not _single_event:
+            return
+        self._restore_stop.clear()
+        self._restore_thread = threading.Thread(
+            target=self._restore_loop,
+            name="ym-restore",
+            daemon=True,
+        )
+        self._restore_thread.start()
+
+    def _stop_restore_watcher(self) -> None:
+        self._restore_stop.set()
+
+    def _restore_loop(self) -> None:
+        event = _single_event
+        if not event:
+            return
+        k = _kernel32()
+        while not self._restore_stop.is_set() and not self.exit_requested:
+            r = k.WaitForSingleObject(event, 250)
+            if r != _WAIT_OBJECT_0:
+                continue
+            try:
+                k.ResetEvent(event)
+            except Exception:
+                pass
+            if not self.exit_requested:
+                self.show_window()
 
 
 class _WinMediaKeys:

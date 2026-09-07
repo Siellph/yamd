@@ -4,7 +4,7 @@ import time
 import webview
 
 from api import Api
-from desktop import DesktopHost, keep_webview_alive
+from desktop import DesktopHost, claim_single_instance, keep_webview_alive
 from local_play_server import start_server
 
 os.environ["PYTHONUTF8"] = "1"
@@ -13,6 +13,9 @@ SERVER_PORT = 5000
 
 
 def main():
+    if not claim_single_instance():
+        return
+
     keep_webview_alive()
     api = Api()
 
