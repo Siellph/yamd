@@ -55,10 +55,18 @@
 
 ```bash
 # Установка библиотек проекта
-pip install pywebview yandex-music
+pip install pywebview yandex-music pystray Pillow
 
 # Установка консольного загрузчика
 pip install yandex-music-downloader
 # Или через pipx (рекомендуется):
 pipx install yandex-music-downloader
 ```
+
+---
+
+## 🧩 Зависимости
+
+**Скачивание файлов** выполняется консольным [yandex-music-downloader](https://github.com/llistochek/yandex-music-downloader) (llistochek) — его нужно установить отдельно, как выше.
+
+Каталог Яндекс.Музыки (поиск, плейлисты, плеер, метаданные) работает через библиотеку [yandex-music](https://github.com/MarshalX/yandex-music-api) (MarshalX).

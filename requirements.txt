@@ -1,5 +1,7 @@
 Flask==3.1.3
 mutagen==1.47.0
+Pillow==12.3.0
+pystray==0.19.5
 pywebview==6.2.1
 yandex-music==3.0.0
-yandex-music-downloader @ https://github.com/llistochek/yandex-music-downloader/archive/main.zip#sha256=6fd28b51acb74cacb94266b936def53a3ee4c853a99ef56d2766a70e895ebe24
+yandex-music-downloader @ https://github.com/llistochek/yandex-music-downloader/archive/main.zip#sha256=04784eabe54e3f063c4040f6c30bf2ef0b2900a367cc3ca50d12eccdca6ce7ef

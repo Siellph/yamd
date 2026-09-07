@@ -16,7 +16,7 @@ import subprocess
 import webview
 
 import config as cfg_module
-from downloader import DownloadManager
+from downloader import DownloadManager, delete_lyrics_for_track, read_local_lyrics
 from local_play_server import read_audio_meta, read_ym_track_id
 from ym_client import YMClient, fmt_duration
 
@@ -24,12 +24,28 @@ from ym_client import YMClient, fmt_duration
 class Api:
     def __init__(self) -> None:
         self._cfg = cfg_module.load()
+        self._cfg.pop("last_play", None)
+        self._last_play = cfg_module.load_last_play()
+        self._last_play_lock = threading.Lock()
+        self._last_play_dirty = threading.Event()
+        self._last_play_writer = threading.Thread(
+            target=self._last_play_writer_loop, daemon=True
+        )
+        self._last_play_writer.start()
         self._ym = YMClient()
         self._window: Optional[webview.Window] = None
+        token = (self._cfg.get("token") or "").strip()
+        if token:
+            threading.Thread(
+                target=lambda t=token: self._ym.ensure(t),
+                daemon=True,
+            ).start()
 
         self._dl = DownloadManager(
             on_status=self._on_dl_status,
             on_log=self._on_dl_log,
+            native_download=self._ym.download_track_to,
+            fetch_lyrics=self._fetch_lyrics_for_download,
         )
 
         # Флаг отмены Device Flow
@@ -56,15 +72,77 @@ class Api:
     def _on_dl_log(self, msg: str, kind: str) -> None:
         self._log(msg, kind)
 
+    def _ensure_client(self) -> bool:
+        token = (self._cfg.get("token") or "").strip()
+        if not token:
+            return False
+        return bool(self._ym.ensure(token))
+
     # ── Конфиг ────────────────────────────────────────────────────────────
 
     def get_config(self) -> dict:
-        return self._cfg
+        out = dict(self._cfg)
+        if self._last_play:
+            out["last_play"] = self._last_play
+        return out
 
     def save_config(self, data: dict) -> bool:
-        self._cfg.update(data)
+        old = (self._cfg.get("token") or "").strip()
+        incoming = dict(data or {})
+        incoming.pop("last_play", None)
+        # Поле пароля в WebView часто приходит пустым; last_play/частичные
+        # сохранения не должны затирать токен и сбрасывать живой YM-клиент.
+        if "token" in incoming:
+            new_token = (incoming.get("token") or "").strip()
+            if not new_token and old:
+                incoming.pop("token", None)
+            else:
+                incoming["token"] = new_token
+        self._cfg.pop("last_play", None)
+        self._cfg.update(incoming)
         cfg_module.save(self._cfg)
-        # Сбросить клиент если изменился токен
+        new = (self._cfg.get("token") or "").strip()
+        if new != old:
+            self._ym.reset()
+            if new:
+                self._ym.ensure(new)
+        return True
+
+    def save_last_play(self, data) -> bool:
+        """Снимок плеера: сразу в память, файл — в фоне. Не трогает токен и YM-клиент."""
+        with self._last_play_lock:
+            self._last_play = data if data else None
+        self._last_play_dirty.set()
+        return True
+
+    def get_last_play(self):
+        with self._last_play_lock:
+            return self._last_play
+
+    def flush_last_play(self) -> None:
+        """Синхронная запись уже известного снимка. Без JS."""
+        with self._last_play_lock:
+            snapshot = self._last_play
+        try:
+            cfg_module.save_last_play(snapshot)
+        except Exception:
+            pass
+
+    def _last_play_writer_loop(self) -> None:
+        while True:
+            self._last_play_dirty.wait()
+            self._last_play_dirty.clear()
+            time.sleep(0.25)
+            if self._last_play_dirty.is_set():
+                continue
+            self.flush_last_play()
+
+    def logout(self) -> bool:
+        """Удаляет токен из настроек и сбрасывает клиент."""
+        self._cfg["token"] = ""
+        cfg_module.save(self._cfg)
+        self._ym.reset()
+        self._log("Вы вышли из аккаунта", "info")
         return True
 
     # ── Авторизация: Device Flow ──────────────────────────────────────────
@@ -234,7 +312,7 @@ class Api:
         threading.Thread(target=_worker, daemon=True).start()
 
     def open_artist_tracks(self, artist_id: str, page: int = 0) -> None:
-        """Порция треков исполнителя → py:artist_tracks_page."""
+        """Все треки исполнителя → py:artist_tracks_page."""
         def _worker():
             token = self._cfg.get("token", "").strip()
             if not token or not self._ym.ensure(token):
@@ -348,6 +426,32 @@ class Api:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def rename_playlist(self, playlist_id: str, title: str) -> None:
+        """Переименовывает свой плейлист → py:playlist_renamed."""
+        def _worker():
+            token = self._cfg.get("token", "").strip()
+            if not token or not self._ym.ensure(token):
+                self._emit("playlist_renamed", {
+                    "ok": False, "playlist_id": playlist_id, "title": title,
+                    "playlist": None, "msg": "Нет авторизации",
+                })
+                return
+            try:
+                pl = self._ym.rename_playlist(playlist_id, title)
+                self._emit("playlist_renamed", {
+                    "ok": True, "playlist_id": playlist_id, "title": pl.get("title", title),
+                    "playlist": pl, "msg": "",
+                })
+                self._log(f"✓ Плейлист переименован: «{pl.get('title', title)}»", "ok")
+            except Exception as e:
+                self._emit("playlist_renamed", {
+                    "ok": False, "playlist_id": playlist_id, "title": title,
+                    "playlist": None, "msg": str(e),
+                })
+                self._log(f"✗ Не удалось переименовать плейлист: {e}", "err")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def delete_playlist(self, playlist_id: str) -> None:
         """Удаляет свой плейлист → py:playlist_deleted."""
         def _worker():
@@ -420,6 +524,32 @@ class Api:
                     "ok": False, "track_id": track_id, "playlist_id": playlist_id, "msg": str(e),
                 })
                 self._log(f"✗ Не удалось удалить трек из плейлиста: {e}", "err")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def remove_unavailable_from_playlist(self, playlist_id: str, track_ids: list) -> None:
+        """Массово вырезает недоступные треки → py:remove_unavailable_result."""
+        def _worker():
+            token = self._cfg.get("token", "").strip()
+            if not token or not self._ym.ensure(token):
+                self._emit("remove_unavailable_result", {
+                    "ok": False, "playlist_id": playlist_id, "removed": 0,
+                    "track_ids": track_ids or [], "msg": "Нет авторизации",
+                })
+                return
+            try:
+                n = self._ym.remove_tracks_from_playlist(playlist_id, track_ids)
+                self._emit("remove_unavailable_result", {
+                    "ok": True, "playlist_id": playlist_id, "removed": n,
+                    "track_ids": track_ids or [], "msg": "",
+                })
+                self._log(f"✓ Удалено недоступных треков: {n}", "ok")
+            except Exception as e:
+                self._emit("remove_unavailable_result", {
+                    "ok": False, "playlist_id": playlist_id, "removed": 0,
+                    "track_ids": track_ids or [], "msg": str(e),
+                })
+                self._log(f"✗ Не удалось удалить недоступные треки: {e}", "err")
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -521,6 +651,65 @@ class Api:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def get_disliked_library(self) -> None:
+        """Дизлайки треков и исполнителей → py:disliked_library."""
+        def _worker():
+            token = self._cfg.get("token", "").strip()
+            if not token or not self._ym.ensure(token):
+                self._emit("disliked_library", {"tracks": [], "artists": []})
+                return
+            try:
+                self._emit("disliked_library", self._ym.get_disliked_library())
+            except Exception as e:
+                self._log(f"Ошибка загрузки дизлайков: {e}", "err")
+                self._emit("disliked_library", {"tracks": [], "artists": []})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def toggle_track_dislike(self, track_id: str, disliked: bool) -> None:
+        """Результат → py:dislike_result."""
+        def _worker():
+            token = self._cfg.get("token", "").strip()
+            if not token or not self._ym.ensure(token):
+                self._emit("dislike_result", {
+                    "track_id": track_id, "disliked": not disliked, "ok": False, "msg": "Нет авторизации",
+                })
+                return
+            try:
+                self._ym.set_track_disliked(track_id, disliked)
+                self._emit("dislike_result", {
+                    "track_id": track_id, "disliked": disliked, "ok": True, "msg": "",
+                })
+            except Exception as e:
+                self._emit("dislike_result", {
+                    "track_id": track_id, "disliked": not disliked, "ok": False, "msg": str(e),
+                })
+                self._log(f"✗ Не удалось изменить дизлайк: {e}", "err")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def toggle_artist_dislike(self, artist_id: str, disliked: bool) -> None:
+        """Результат → py:artist_dislike_result."""
+        def _worker():
+            token = self._cfg.get("token", "").strip()
+            if not token or not self._ym.ensure(token):
+                self._emit("artist_dislike_result", {
+                    "id": artist_id, "disliked": not disliked, "ok": False, "msg": "Нет авторизации",
+                })
+                return
+            try:
+                self._ym.set_artist_disliked(artist_id, disliked)
+                self._emit("artist_dislike_result", {
+                    "id": artist_id, "disliked": disliked, "ok": True, "msg": "",
+                })
+            except Exception as e:
+                self._emit("artist_dislike_result", {
+                    "id": artist_id, "disliked": not disliked, "ok": False, "msg": str(e),
+                })
+                self._log(f"✗ Не удалось изменить дизлайк исполнителя: {e}", "err")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     # ── Текст песни ──────────────────────────────────────────────────────────
 
     def get_lyrics(self, track_id: str) -> None:
@@ -531,13 +720,61 @@ class Api:
                 self._emit("lyrics_result", {"track_id": track_id, "text": None})
                 return
             try:
-                text = self._ym.get_lyrics(track_id)
-                self._emit("lyrics_result", {"track_id": track_id, "text": text})
+                data = self._ym.get_lyrics(track_id) or {}
+                self._emit("lyrics_result", {
+                    "track_id": track_id,
+                    "text": data.get("text"),
+                    "sync": data.get("sync") or None,
+                })
             except Exception as e:
                 self._log(f"Ошибка загрузки текста песни: {e}", "err")
                 self._emit("lyrics_result", {"track_id": track_id, "text": None})
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def get_local_lyrics(self, track_id: str) -> None:
+        """Текст из данных приложения по id трека Яндекса → py:lyrics_result."""
+        def _worker():
+            try:
+                tid = self._lyrics_track_id(track_id)
+                data = read_local_lyrics(tid) if tid else {"text": None, "sync": None}
+                self._emit("lyrics_result", {
+                    "track_id": track_id,
+                    "text": data.get("text"),
+                    "sync": data.get("sync") or None,
+                })
+            except Exception:
+                self._emit("lyrics_result", {"track_id": track_id, "text": None})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _lyrics_track_id(self, key: str) -> str:
+        """YM id: напрямую или из тегов/индекса, если пришёл путь к файлу."""
+        key = str(key or "").strip()
+        if not key:
+            return ""
+        suffix = Path(key).suffix.lower()
+        looks_like_path = (
+            ("/" in key) or ("\\" in key)
+            or suffix in {".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wav"}
+        )
+        if not looks_like_path:
+            return key
+        base = Path(self._cfg.get("download_dir", "") or ".").resolve()
+        try:
+            audio = (base / key).resolve()
+            audio.relative_to(base)
+        except Exception:
+            return ""
+        tid = read_ym_track_id(audio) if audio.is_file() else ""
+        return tid or self._track_id_for_rel_path(key)
+
+    def _fetch_lyrics_for_download(self, track_id: str, cfg: dict | None = None) -> dict:
+        cfg = cfg or self._cfg
+        token = str(cfg.get("token") or "").strip()
+        if token:
+            self._ym.ensure(token)
+        return self._ym.get_lyrics_files(str(track_id))
 
     # ── Скачивание ────────────────────────────────────────────────────────
 
@@ -555,13 +792,46 @@ class Api:
 
     def get_preview_url(self, track_id: str) -> None:
         """Результат → py:preview_url или py:preview_error."""
+        def _fail(msg: str, *, transient: bool, reason: str, log: bool = True):
+            self._emit("preview_error", {
+                "track_id": track_id,
+                "msg": msg,
+                "transient": transient,
+                "reason": reason,
+            })
+            if log:
+                self._log(f"Ошибка превью: {msg}", "err")
+
         def _worker():
+            token = (self._cfg.get("token") or "").strip()
+            if not token:
+                _fail("Нет авторизации", transient=True, reason="no_auth", log=False)
+                return
             try:
+                if not self._ym.ensure(token):
+                    _fail(
+                        "Не удалось подключиться к Яндекс.Музыке",
+                        transient=True,
+                        reason="no_client",
+                    )
+                    return
                 url = self._ym.get_preview_url(track_id)
                 self._emit("preview_url", {"track_id": track_id, "url": url})
             except Exception as e:
-                self._emit("preview_error", {"track_id": track_id, "msg": str(e)})
-                self._log(f"Ошибка превью: {e}", "err")
+                msg = str(e)
+                low = msg.lower()
+                transient = (
+                    "не инициализирован" in low
+                    or "timeout" in low
+                    or "timed out" in low
+                    or "temporarily" in low
+                    or "connection" in low
+                )
+                _fail(
+                    msg,
+                    transient=transient,
+                    reason="no_client" if "не инициализирован" in low else "preview",
+                )
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -573,6 +843,9 @@ class Api:
         """
         def _worker():
             try:
+                if not self._ensure_client():
+                    self._emit("track_prefetched", {"track_id": track_id, "url": ""})
+                    return
                 url = self._ym.get_preview_url(track_id)
                 self._emit("track_prefetched", {"track_id": track_id, "url": url})
             except Exception:
@@ -594,8 +867,15 @@ class Api:
             base = Path(base_str).resolve()
             exts = {".mp3", ".flac", ".aac", ".m4a", ".ogg", ".opus"}
             files = []
+            skip_top = {"lrc", "txt"}
             if base.exists():
                 for f in sorted(base.rglob("*")):
+                    try:
+                        top = f.relative_to(base).parts[0].lower()
+                    except (ValueError, IndexError):
+                        top = ""
+                    if top in skip_top:
+                        continue
                     if f.suffix.lower() in exts:
                         try:
                             rel = f.relative_to(base).as_posix()
@@ -673,7 +953,12 @@ class Api:
         try:
             if not target.is_file():
                 raise FileNotFoundError("Файл не найден")
+            tid = read_ym_track_id(target) or self._track_id_for_rel_path(rel_path)
             self._unlink_with_retry(target)
+            if target.is_file():
+                raise OSError("Не удалось удалить файл")
+            if tid:
+                delete_lyrics_for_track(tid)
             self._remove_empty_dirs(target.parent, base)
             self._forget_download_path(rel_path)
             return True, ""
@@ -805,6 +1090,17 @@ class Api:
                 "artist": artist or prev.get("artist") or "",
             }
             self._save_dl_index(index)
+
+    def _track_id_for_rel_path(self, rel_path: str) -> str:
+        rel = str(rel_path or "")
+        if not rel:
+            return ""
+        with self._dl_index_lock:
+            index = self._load_dl_index()
+            for tid, info in index.items():
+                if (info.get("rel_path") or "") == rel:
+                    return str(tid)
+        return ""
 
     def _forget_download_path(self, rel_path: str) -> None:
         with self._dl_index_lock:

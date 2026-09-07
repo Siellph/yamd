@@ -1,6 +1,7 @@
 __pycache__
 .venv
 config.json
+lyrics/
 yamd.zip
 .gigacode
 build
@@ -9,3 +10,4 @@ YMDownloader.spec
 setup_script.iss
 .vscode
 YaMD_setup.exe
+last_play.json

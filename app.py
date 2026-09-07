@@ -4,6 +4,7 @@ import time
 import webview
 
 from api import Api
+from desktop import DesktopHost, keep_webview_alive
 from local_play_server import start_server
 
 os.environ["PYTHONUTF8"] = "1"
@@ -12,6 +13,7 @@ SERVER_PORT = 5000
 
 
 def main():
+    keep_webview_alive()
     api = Api()
 
     threading.Thread(target=start_server, args=(SERVER_PORT,), daemon=True).start()
@@ -23,15 +25,22 @@ def main():
         title="Yandex Music Downloader",
         url=f"http://127.0.0.1:{SERVER_PORT}/",
         js_api=api,
-        width=1020,
-        height=720,
-        min_size=(820, 560),
+        width=1080,
+        height=740,
+        min_size=(960, 680),
         background_color="#0f0f11",
     )
 
     api._window = window
+    host = DesktopHost(window, api)
+    host.attach()
 
-    webview.start(debug=False)
+    try:
+        webview.start(debug=False, private_mode=False)
+    except TypeError:
+        webview.start(debug=False)
+    finally:
+        host.shutdown()
 
 
 if __name__ == "__main__":

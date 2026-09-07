@@ -5,10 +5,13 @@
 """
 from __future__ import annotations
 
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
+from urllib.request import Request, urlopen
 
 from yandex_music import Client, Track
 from yandex_music.exceptions import DeviceAuthError
@@ -25,12 +28,94 @@ def fmt_duration(ms: int | None) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
+_LRC_TS = re.compile(r"\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]")
+_LRC_OFFSET = re.compile(r"\[offset:([+-]?\d+)\]", re.I)
+
+
+def _lrc_frac_to_sec(frac: str | None) -> float:
+    """LRC: 1–2 знака — сотые/десятые, 3 знака — миллисекунды."""
+    if not frac:
+        return 0.0
+    if len(frac) >= 3:
+        return int(frac[:3]) / 1000.0
+    return int(frac) / (10 ** len(frac))
+
+
+def parse_lrc(raw: str | None) -> list[dict]:
+    """Разбирает LRC в [{t: секунды, text}]. Учитывает [offset:мс]."""
+    text = raw or ""
+    off = 0.0
+    m = _LRC_OFFSET.search(text)
+    if m:
+        try:
+            off = int(m.group(1)) / 1000.0
+        except ValueError:
+            off = 0.0
+    out: list[dict] = []
+    for row in text.splitlines():
+        stamps = _LRC_TS.findall(row)
+        if not stamps:
+            continue
+        line = _LRC_TS.sub("", row).strip()
+        for mm, ss, frac in stamps:
+            t = int(mm) * 60 + int(ss) + _lrc_frac_to_sec(frac) + off
+            out.append({"t": max(0.0, t), "text": line})
+    out.sort(key=lambda x: x["t"])
+    return out
+
+
 def cover_urls(uri: str | None, size: str = "100x100") -> tuple[str, str]:
     """(готовый url нужного размера, шаблон с %%) для cover_uri из API."""
     if not uri:
         return "", ""
-    tmpl = "https://" + uri
+    raw = str(uri).lstrip("/")
+    if raw.startswith("http://") or raw.startswith("https://"):
+        tmpl = raw
+    else:
+        tmpl = "https://" + raw
     return tmpl.replace("%%", size), tmpl
+
+
+def _cover_uri_list(*values) -> list[str]:
+    """Собирает uri обложек из строк, Cover-объектов и списков items_uri."""
+    uris: list[str] = []
+
+    def add(value):
+        if not value:
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                add(item)
+            return
+        if not isinstance(value, str):
+            add(getattr(value, "uri", None))
+            add(getattr(value, "items_uri", None))
+            return
+        text = value.strip()
+        if text and text not in uris:
+            uris.append(text)
+
+    for value in values:
+        add(value)
+    return uris
+
+
+def playlist_cover_url(pl) -> str:
+    """
+    Обложка из ответа списка плейлистов, без загрузки треков.
+    Cover.get_url() нельзя: если uri уже с https://, библиотека клеит
+    второй https:// и картинка 404. Размер 100x100; другие размеры
+    пробует интерфейс, если CDN не отдаёт этот.
+    """
+    for uri in _cover_uri_list(
+        getattr(pl, "cover", None),
+        getattr(pl, "og_image", None),
+        getattr(pl, "cover_without_text", None),
+    ):
+        url, _ = cover_urls(uri, "100x100")
+        if url:
+            return url
+    return ""
 
 
 def artist_to_dict(a) -> dict:
@@ -56,9 +141,7 @@ def artist_to_dict(a) -> dict:
 
 def playlist_to_dict(pl, group: str) -> dict:
     """Карточка плейлиста для интерфейса."""
-    cover = ""
-    if pl.cover and getattr(pl.cover, "uri", None):
-        cover = "https://" + pl.cover.uri.replace("%%", "100x100")
+    cover = playlist_cover_url(pl)
     owner_login = ""
     if getattr(pl, "owner", None) and getattr(pl.owner, "login", None):
         owner_login = pl.owner.login
@@ -89,23 +172,54 @@ def album_to_dict(al) -> dict:
     }
 
 
+def _coerce_track(t):
+    """TrackShort / обёртки с .track → сам Track. Иначе объект как есть."""
+    if t is None:
+        return None
+    inner = getattr(t, "track", None)
+    if inner is not None and inner is not t and (
+        getattr(inner, "id", None) is not None or getattr(inner, "title", None)
+    ):
+        return inner
+    return t
+
+
+def _track_available(t) -> bool:
+    """False только если API явно говорит, что трека нет (available is False / error)."""
+    t = _coerce_track(t)
+    if t is None:
+        return False
+    if getattr(t, "available", None) is False:
+        return False
+    if getattr(t, "error", None):
+        return False
+    return True
+
+
+def _unavailable_track_dict(track_id, source_url: str, num: int, title: str = "") -> dict:
+    return {
+        "id": str(track_id or f"unknown_{num}"),
+        "num": num,
+        "title": title or "Недоступный трек",
+        "artist": "",
+        "artists": [],
+        "album": "",
+        "album_id": None,
+        "duration": "—",
+        "duration_ms": 0,
+        "cover_uri": "",
+        "cover_uri_tmpl": "",
+        "status": "idle",
+        "source_url": source_url,
+        "available": False,
+    }
+
+
 def track_to_dict(t, source_url: str, num: int) -> dict:
     """Конвертирует yandex_music.Track → словарь для JS."""
+    t = _coerce_track(t)
     if t is None:
-        return {
-            "id": f"unknown_{num}",
-            "num": num,
-            "title": "Неизвестный трек",
-            "artist": "",
-            "artists": [],
-            "album": "",
-            "album_id": None,
-            "duration": "—",
-            "cover_uri": "",
-            "cover_uri_tmpl": "",
-            "status": "idle",
-            "source_url": source_url,
-        }
+        return _unavailable_track_dict(f"unknown_{num}", source_url, num)
     artist_list = [
         {"id": str(a.id) if a.id is not None else "", "name": a.name}
         for a in (t.artists or []) if a and a.name
@@ -135,6 +249,7 @@ def track_to_dict(t, source_url: str, num: int) -> dict:
         "duration_ms": t.duration_ms or 0,
         "status": "idle",
         "source_url": source_url,
+        "available": _track_available(t),
     }
 
 
@@ -152,7 +267,10 @@ def tracks_from_playlist(pl, url: str) -> list[dict]:
             try:
                 t = short.fetch_track()
             except Exception:
-                continue
+                t = None
+        if t is None:
+            result.append(_unavailable_track_dict(getattr(short, "id", None), url, i))
+            continue
         result.append(track_to_dict(t, url, i))
     return result
 
@@ -182,6 +300,90 @@ def parse_url(url: str) -> dict | None:
     return None
 
 
+def _pick_download_info(infos, quality: str):
+    """quality 0/1/2 как у CLI: хуже / среднее / лучшее. Предпочитаем mp3."""
+    if not infos:
+        return None
+    mp3s = [i for i in infos if str(getattr(i, "codec", "") or "").lower() == "mp3"]
+    pool = mp3s or list(infos)
+    pool.sort(key=lambda i: i.bitrate_in_kbps or 0)
+    if quality == "0":
+        return pool[0]
+    if quality == "1" and len(pool) > 1:
+        return pool[len(pool) // 2]
+    return pool[-1]
+
+
+def _cover_bytes(track, resolution: str) -> bytes:
+    size = "1000x1000" if not resolution or resolution == "original" else str(resolution)
+    if "x" not in size:
+        size = f"{size}x{size}"
+    try:
+        data = track.download_cover_bytes(size=size)
+        return data or b""
+    except Exception:
+        return b""
+
+
+def _http_download(url: str, dest: Path, timeout: int = 60) -> None:
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        with urlopen(req, timeout=timeout) as resp, tmp.open("wb") as out:
+            while True:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+        tmp.replace(dest)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+def _write_audio_tags(path: Path, ym_track, track_id: str, cover_bytes: bytes) -> None:
+    """ID3: название можно оставить со слэшем — ломается только путь файла."""
+    try:
+        from mutagen.id3 import APIC, COMM, ID3, TALB, TIT2, TPE1, WOAR
+        try:
+            from mutagen.id3 import ID3NoHeaderError
+        except ImportError:
+            ID3NoHeaderError = Exception
+    except Exception:
+        return
+    try:
+        tags = ID3(path)
+    except ID3NoHeaderError:
+        tags = ID3()
+    except Exception:
+        return
+    title = getattr(ym_track, "title", None) or path.stem
+    artists = ", ".join(a.name for a in (getattr(ym_track, "artists", None) or []) if a and a.name)
+    album = ""
+    if getattr(ym_track, "albums", None):
+        a0 = ym_track.albums[0]
+        if a0:
+            album = a0.title or ""
+    tags["TIT2"] = TIT2(encoding=3, text=title)
+    if artists:
+        tags["TPE1"] = TPE1(encoding=3, text=artists)
+    if album:
+        tags["TALB"] = TALB(encoding=3, text=album)
+    tags.add(COMM(encoding=3, lang="eng", desc="yandex", text=str(track_id)))
+    tags.add(WOAR(url=f"https://music.yandex.ru/track/{track_id}"))
+    if cover_bytes:
+        mime = "image/png" if cover_bytes[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
+        tags.delall("APIC")
+        tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=cover_bytes))
+    try:
+        tags.save(path)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Менеджер клиента
 # ---------------------------------------------------------------------------
@@ -196,9 +398,18 @@ class YMClient:
         self._wave_session_id: str | None = None
         self._wave_batch_id: str | None = None
         self._wave_last_id: str | None = None
-        self._lyrics_cache: dict[str, str | None] = {}
+        self._lyrics_cache: dict[str, dict | None] = {}
 
     # ── Авторизация ────────────────────────────────────────────────────────
+
+    def reset(self) -> None:
+        """Сбрасывает клиент и сессию волны — после выхода или смены токена."""
+        with self._lock:
+            self._client = None
+            self._wave_session_id = None
+            self._wave_batch_id = None
+            self._wave_last_id = None
+            self._lyrics_cache.clear()
 
     def ensure(self, token: str) -> bool:
         """Инициализирует клиент по токену. Возвращает True при успехе."""
@@ -260,7 +471,16 @@ class YMClient:
         def _system() -> list[dict]:
             if not uid:
                 return []
-            liked_pl = c.users_playlists(kind=3, user_id=uid)
+            liked_pl = None
+            # Карточке нужны только метаданные. users_playlists(kind=3) тянет
+            # все лайкнутые треки и из-за этого тормозит всю сетку.
+            try:
+                items = c.playlists_list([f"{uid}:3"]) or []
+                liked_pl = items[0] if items else None
+            except Exception:
+                liked_pl = None
+            if liked_pl is None:
+                liked_pl = c.users_playlists(kind=3, user_id=uid)
             if not liked_pl:
                 return []
             if not liked_pl.title:
@@ -315,6 +535,30 @@ class YMClient:
             raise RuntimeError("Яндекс не вернул созданный плейлист")
         return playlist_to_dict(pl, "created")
 
+    def rename_playlist(self, playlist_kind, title: str) -> dict:
+        """Переименовывает плейлист, созданный самим пользователем."""
+        c = self._client
+        if not c:
+            raise RuntimeError("Клиент не инициализирован")
+        kind = int(str(playlist_kind).strip())
+        if kind == self.LIKED_PLAYLIST_KIND:
+            raise RuntimeError("Системный плейлист «Мне нравится» переименовать нельзя")
+        name = (title or "").strip()
+        if not name:
+            raise ValueError("Введите название плейлиста")
+        pl = c.users_playlists_name(kind, name)
+        if pl:
+            return playlist_to_dict(pl, "created")
+        return {
+            "id": str(kind),
+            "title": name,
+            "owner": "",
+            "count": 0,
+            "cover": "",
+            "url": "",
+            "group": "created",
+        }
+
     def delete_playlist(self, playlist_kind) -> bool:
         """Удаляет плейлист, созданный самим пользователем."""
         c = self._client
@@ -364,29 +608,33 @@ class YMClient:
 
         return {"artist": artist_to_dict(info.artist), "tracks": tracks, "albums": albums}
 
-    def get_artist_tracks(self, artist_id, page: int = 0, page_size: int = 80) -> dict:
-        """Страница «все треки» исполнителя — как на music.yandex.ru/artist/.../tracks."""
+    def get_artist_tracks(self, artist_id, page: int = 0, page_size: int = 200) -> dict:
+        """Все треки исполнителя одним ответом (страницы API запрашиваются внутри)."""
         c = self._client
         if not c:
             raise RuntimeError("Клиент не инициализирован")
 
-        res = c.artists_tracks(artist_id, page=page, page_size=page_size)
-        raw = (res.tracks if res else None) or []
         source = f"https://music.yandex.ru/artist/{artist_id}/tracks"
-        start = page * page_size
-        tracks = [track_to_dict(t, source, start + i) for i, t in enumerate(raw, 1)]
-
-        pager = getattr(res, "pager", None)
-        total = getattr(pager, "total", None) if pager else None
-        loaded = start + len(tracks)
-        has_more = len(raw) >= page_size
-        if total is not None:
-            has_more = loaded < int(total)
+        tracks, total, page_i = [], None, 0
+        # page оставлен для совместимости вызова, но всегда собираем полный список
+        while page_i < 80:
+            res = c.artists_tracks(artist_id, page=page_i, page_size=page_size)
+            raw = (res.tracks if res else None) or []
+            start = len(tracks)
+            tracks.extend(track_to_dict(t, source, start + i) for i, t in enumerate(raw, 1))
+            pager = getattr(res, "pager", None)
+            if pager is not None:
+                total = getattr(pager, "total", total)
+            if not raw or len(raw) < page_size:
+                break
+            if total is not None and len(tracks) >= int(total):
+                break
+            page_i += 1
         return {
             "tracks": tracks,
-            "page": page,
-            "has_more": has_more,
-            "total": int(total) if total else loaded,
+            "page": 0,
+            "has_more": False,
+            "total": int(total) if total is not None else len(tracks),
         }
 
     def get_album(self, album_id) -> dict:
@@ -734,7 +982,8 @@ class YMClient:
     def remove_track_from_playlist(self, playlist_kind, track_id) -> bool:
         """
         Удаляет трек из плейлиста, созданного пользователем.
-        Для «Мне нравится» (kind=3) удаление — это снятие лайка.
+        Для «Мне нравится» (kind=3): снятие лайка, а если трек уже снят
+        с сервиса и остался серой строкой — вырезаем его из системного плейлиста.
         """
         c = self._client
         if not c:
@@ -742,15 +991,84 @@ class YMClient:
 
         kind = int(playlist_kind)
         if kind == self.LIKED_PLAYLIST_KIND:
-            self.set_track_liked(track_id, False)
-            return True
+            return self._remove_from_liked_playlist(track_id)
 
-        if kind not in self._own_playlist_kinds():
-            raise RuntimeError("Из этого плейлиста нельзя удалять треки — он не создан вами")
+        self._delete_playlist_track_at(kind, track_id)
+        return True
 
+    def remove_tracks_from_playlist(self, playlist_kind, track_ids) -> int:
+        """
+        Удаляет набор треков одним проходом.
+        Позиции с конца, диапазонами — иначе revision плейлиста разъедется.
+        """
+        c = self._client
+        if not c:
+            raise RuntimeError("Клиент не инициализирован")
+        kind = int(str(playlist_kind).strip())
+        ids = [str(x) for x in (track_ids or []) if str(x)]
+        if not ids:
+            return 0
+        if kind == self.LIKED_PLAYLIST_KIND:
+            return self._remove_tracks_from_liked(ids)
+        return self._remove_tracks_by_ids(kind, ids)
+
+    def _merge_index_ranges(self, indices: list[int]) -> list[tuple[int, int]]:
+        """Индексы → полуинтервалы [from, to), как ждёт users_playlists_delete_track."""
+        if not indices:
+            return []
+        xs = sorted(set(indices))
+        ranges: list[tuple[int, int]] = []
+        start = prev = xs[0]
+        for i in xs[1:]:
+            if i == prev + 1:
+                prev = i
+                continue
+            ranges.append((start, prev + 1))
+            start = prev = i
+        ranges.append((start, prev + 1))
+        return ranges
+
+    def _remove_tracks_by_ids(self, kind: int, track_ids: list[str]) -> int:
+        """Удаляет указанные id из своего плейлиста, с конца и с обновлением revision."""
+        c = self._client
+        wanted = set(track_ids)
+        removed = 0
+        for _ in range(400):
+            pl = self._own_playlist(kind)
+            indices = [
+                i for i, short in enumerate(pl.tracks or [])
+                if short is not None and str(getattr(short, "id", "")) in wanted
+            ]
+            if not indices:
+                break
+            a, b = self._merge_index_ranges(indices)[-1]
+            c.users_playlists_delete_track(
+                kind=kind,
+                from_=a,
+                to=b,
+                revision=pl.revision,
+            )
+            removed += b - a
+        return removed
+
+    def _remove_tracks_from_liked(self, track_ids: list[str]) -> int:
+        removed = 0
+        seen: set[str] = set()
+        for tid in track_ids:
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            try:
+                self._remove_from_liked_playlist(tid)
+                removed += 1
+            except Exception:
+                continue
+        return removed
+
+    def _delete_playlist_track_at(self, kind: int, track_id) -> None:
+        """Удаляет трек из плейлиста по позиции — API не умеет удалять по id."""
+        c = self._client
         pl = self._own_playlist(kind)
-
-        # Индекс нужен точный и свежий: API удаляет по позиции, а не по id
         target = str(track_id)
         index = None
         for i, short in enumerate(pl.tracks or []):
@@ -759,13 +1077,28 @@ class YMClient:
                 break
         if index is None:
             raise RuntimeError("Трек не найден в плейлисте")
-
         c.users_playlists_delete_track(
             kind=kind,
             from_=index,
             to=index + 1,
             revision=pl.revision,
         )
+
+    def _remove_from_liked_playlist(self, track_id) -> bool:
+        """
+        «Мне нравится»: живой трек уходит снятием лайка.
+        Удалённый с сервиса трек Яндекс сам снимает лайк, но строка остаётся
+        в системном плейлисте — её нужно вырезать по позиции.
+        """
+        try:
+            self.set_track_liked(track_id, False)
+        except Exception:
+            pass
+        try:
+            self._delete_playlist_track_at(self.LIKED_PLAYLIST_KIND, track_id)
+        except RuntimeError:
+            # Уже нет в плейлисте — снятие лайка было достаточно
+            return True
         return True
 
     # ── Лайки ("Мне нравится") ───────────────────────────────────────────
@@ -845,35 +1178,168 @@ class YMClient:
             return bool(c.users_likes_albums_add(album_id))
         return bool(c.users_likes_albums_remove(album_id))
 
+    # ── Дизлайки ("Не рекомендовать") ────────────────────────────────────
+
+    def get_disliked_library(self) -> dict:
+        """Треки и исполнители с отметкой «Не рекомендовать»."""
+        c = self._client
+        if not c:
+            return {"tracks": [], "artists": []}
+
+        def _tracks() -> list[dict]:
+            likes = c.users_dislikes_tracks()
+            if not likes:
+                return []
+            out = []
+            for i, short in enumerate(likes.tracks or [], 1):
+                t = getattr(short, "track", None)
+                if t is None:
+                    try:
+                        t = short.fetch_track()
+                    except Exception:
+                        t = None
+                if t is None:
+                    out.append(_unavailable_track_dict(getattr(short, "id", None), "dislikes", i))
+                else:
+                    out.append(track_to_dict(t, "dislikes", i))
+            return out
+
+        def _artists() -> list[dict]:
+            out = []
+            for item in (c.users_dislikes_artists() or []):
+                a = getattr(item, "artist", None) or item
+                if a and getattr(a, "id", None) is not None:
+                    out.append(artist_to_dict(a))
+            return out
+
+        tracks, artists = [], []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ft, fa = pool.submit(_tracks), pool.submit(_artists)
+            try:
+                tracks = ft.result()
+            except Exception as e:
+                print(f"Ошибка дизлайков треков: {e}")
+            try:
+                artists = fa.result()
+            except Exception as e:
+                print(f"Ошибка дизлайков исполнителей: {e}")
+        return {"tracks": tracks, "artists": artists}
+
+    def set_track_disliked(self, track_id: str, disliked: bool) -> bool:
+        """Ставит/снимает отметку «Не рекомендовать» треку."""
+        c = self._client
+        if not c:
+            raise RuntimeError("Клиент не инициализирован")
+        if disliked:
+            return bool(c.users_dislikes_tracks_add(track_id))
+        return bool(c.users_dislikes_tracks_remove(track_id))
+
+    def set_artist_disliked(self, artist_id: str, disliked: bool) -> bool:
+        """Ставит/снимает отметку «Не рекомендовать» исполнителю."""
+        c = self._client
+        if not c:
+            raise RuntimeError("Клиент не инициализирован")
+        if disliked:
+            return bool(c.users_dislikes_artists_add(artist_id))
+        return bool(c.users_dislikes_artists_remove(artist_id))
+
     # ── Текст песни ───────────────────────────────────────────────────────
 
-    def get_lyrics(self, track_id: str) -> str | None:
-        """Текст песни (обычный, без таймкодов). None — если недоступен."""
+    def get_lyrics_files(self, track_id: str) -> dict:
+        """Сырые LRC и TEXT с API. Не выдумывает текст."""
+        c = self._client
+        if not c:
+            raise RuntimeError("Клиент не инициализирован")
+        out: dict[str, str | None] = {"lrc": None, "text": None}
+        for fmt, key in (("LRC", "lrc"), ("TEXT", "text")):
+            try:
+                lyrics = c.tracks_lyrics(track_id, format_=fmt)
+                raw = lyrics.fetch_lyrics() if lyrics else None
+            except Exception:
+                continue
+            if raw:
+                out[key] = raw
+        return out
+
+    def get_lyrics(self, track_id: str) -> dict | None:
+        """Текст песни. Сначала LRC (тайминг строк), иначе обычный TEXT."""
         if track_id in self._lyrics_cache:
             return self._lyrics_cache[track_id]
         c = self._client
         if not c:
             raise RuntimeError("Клиент не инициализирован")
+        payload = {"text": None, "sync": None}
+        for fmt in ("LRC", "TEXT"):
+            try:
+                lyrics = c.tracks_lyrics(track_id, format_=fmt)
+                raw = lyrics.fetch_lyrics() if lyrics else None
+            except Exception:
+                continue
+            if not raw:
+                continue
+            if fmt == "LRC":
+                sync = parse_lrc(raw)
+                if sync:
+                    payload["sync"] = sync
+                    payload["text"] = "\n".join(x["text"] for x in sync)
+                    break
+            else:
+                payload["text"] = raw
+                break
+        out = payload if (payload["text"] or payload["sync"]) else None
+        self._lyrics_cache[track_id] = out
+        return out
+
+    # ── Скачивание трека (обход CLI, если в имени / : * и т.п.) ─────────
+
+    def download_track_to(self, track_id: str, dest: Path, cfg: dict | None = None) -> Path:
+        """
+        Качает трек средствами yandex_music в уже безопасный dest.
+        Нужен для названий со слэшем и другими символами, на которых
+        консольный yandex-music-downloader падает с PYI-ошибкой.
+        """
+        cfg = cfg or {}
+        token = str(cfg.get("token") or "").strip()
+        if token:
+            self.ensure(token)
+        with self._lock:
+            c = self._client
+        if not c:
+            raise RuntimeError("Клиент не инициализирован")
+
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        with self._lock:
+            infos = c.tracks_download_info(track_id, get_direct_links=True)
+            tracks = c.tracks(track_id) or []
+            ym_track = tracks[0] if tracks else None
+            best = _pick_download_info(infos, str(cfg.get("quality", "2")))
+            if not best:
+                raise RuntimeError("Нет ссылки на скачивание")
+            link = best.direct_link or best.get_direct_link()
+            cover_bytes = b""
+            if cfg.get("embed_cover") and ym_track is not None:
+                cover_bytes = _cover_bytes(ym_track, cfg.get("cover_resolution", "original"))
+
+        if not link:
+            raise RuntimeError("Пустая ссылка на файл")
+
+        timeout = 60
         try:
-            lyrics = c.tracks_lyrics(track_id, format_="TEXT")
-        except Exception:
-            self._lyrics_cache[track_id] = None
-            return None
-        if not lyrics:
-            self._lyrics_cache[track_id] = None
-            return None
-        try:
-            text = lyrics.fetch_lyrics()
-        except Exception:
-            text = None
-        self._lyrics_cache[track_id] = text
-        return text
+            timeout = max(20, int(cfg.get("timeout") or 60))
+        except (TypeError, ValueError):
+            pass
+        _http_download(link, dest, timeout=timeout)
+        _write_audio_tags(dest, ym_track, track_id, cover_bytes)
+        return dest
 
     # ── Превью / прямая ссылка ────────────────────────────────────────────
 
     def get_preview_url(self, track_id: str) -> str:
         """Возвращает прямую ссылку на аудио (лучшее mp3) для превью."""
-        c = self._client
+        with self._lock:
+            c = self._client
         if not c:
             raise RuntimeError("Клиент не инициализирован")
         infos = c.tracks_download_info(track_id, get_direct_links=True)
