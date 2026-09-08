@@ -10,10 +10,11 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 from urllib.request import Request, urlopen
 
-from yandex_music import Client, Track
+from yandex_music import Client, Playlist, Track
 from yandex_music.exceptions import DeviceAuthError
 
 # ---------------------------------------------------------------------------
@@ -253,22 +254,306 @@ def track_to_dict(t, source_url: str, num: int) -> dict:
     }
 
 
+def _track_is_stub(t) -> bool:
+    """Нет названия — это TrackShort/заглушка, не полноценный трек."""
+    t = _coerce_track(t)
+    if t is None:
+        return True
+    if type(t).__name__ == "TrackShort":
+        return True
+    return not bool(getattr(t, "title", None))
+
+
+def _short_id_keys(short) -> list[str]:
+    """id и id:album — tracks() иногда отвечает только на один из них."""
+    if short is None:
+        return []
+    keys: list[str] = []
+    prop = getattr(short, "track_id", None)
+    if prop:
+        keys.append(str(prop))
+    tid = str(getattr(short, "id", "") or "")
+    album = getattr(short, "album_id", None)
+    if tid and album not in (None, "", 0, "0"):
+        keys.append(f"{tid}:{album}")
+    if tid:
+        keys.append(tid)
+    out, seen = [], set()
+    for k in keys:
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def _index_ym_tracks(tracks) -> dict:
+    by_id: dict = {}
+    for t in tracks or []:
+        if t is None or getattr(t, "id", None) is None:
+            continue
+        tid = str(t.id)
+        by_id[tid] = t
+        albums = getattr(t, "albums", None) or []
+        a0 = albums[0] if albums else None
+        if a0 is not None and getattr(a0, "id", None) is not None:
+            by_id[f"{tid}:{a0.id}"] = t
+    return by_id
+
+
+_PL_PAGE_SIZE = 1000
+_PL_TIMEOUT = 60
+_TRACKS_BATCH = 80
+
+
+def _playlist_query(page: int, page_size: int = _PL_PAGE_SIZE) -> dict:
+    """Query-параметры плейлиста. В _request.get их надо передавать как params, не kwargs."""
+    return {
+        "rich-tracks": "true",
+        "page-size": page_size,
+        "pageSize": page_size,
+        "page": page,
+    }
+
+
+def _account_uid(client):
+    me = getattr(client, "me", None)
+    acc = getattr(me, "account", None) if me else None
+    return getattr(acc, "uid", None)
+
+
+def _short_from_raw(client, item, parsed_by_id: dict):
+    """TrackShort из JSON, если de_json выкинул UGC/битую карточку."""
+    if item is None:
+        return None
+    if not isinstance(item, dict):
+        tid = str(getattr(item, "id", "") or "")
+        return parsed_by_id.get(tid) or item
+    tid = item.get("id")
+    nested = item.get("track")
+    if tid is None and isinstance(nested, dict):
+        tid = nested.get("id")
+    key = str(tid) if tid is not None else ""
+    if key and key in parsed_by_id:
+        return parsed_by_id[key]
+    album = item.get("albumId") if item.get("albumId") is not None else item.get("album_id")
+    if album in (None, "", 0, "0") and isinstance(nested, dict):
+        albums = nested.get("albums") or []
+        if albums and isinstance(albums[0], dict):
+            album = albums[0].get("id")
+    track_id = f"{tid}:{album}" if tid is not None and album not in (None, "", 0, "0") else (str(tid) if tid is not None else "")
+    return SimpleNamespace(
+        id=tid,
+        album_id=album,
+        track=None,
+        track_id=track_id,
+        client=client,
+    )
+
+
+def _restore_dropped_shorts(client, result, pl):
+    """В JSON треков больше, чем после de_json — библиотека роняет UGC."""
+    if pl is None or not isinstance(result, dict):
+        return pl
+    raw = result.get("tracks") or []
+    parsed = list(pl.tracks or [])
+    if len(raw) <= len(parsed):
+        return pl
+    by_id = {}
+    for s in parsed:
+        if s is not None and getattr(s, "id", None) is not None:
+            by_id[str(s.id)] = s
+    pl.tracks = [_short_from_raw(client, item, by_id) for item in raw]
+    return pl
+
+
+def _get_playlist_by_url(client, url: str, page: int):
+    """Прямой GET: users_playlists(kind, user, **kwargs) не кладёт kwargs в query."""
+    params = _playlist_query(page)
+    result = client._request.get(url, params, timeout=_PL_TIMEOUT)
+    try:
+        pl = Playlist.de_json(result, client)
+    except Exception:
+        pl = None
+        if isinstance(result, dict):
+            pl = SimpleNamespace(
+                tracks=[],
+                track_count=result.get("trackCount") or result.get("track_count") or 0,
+                title=result.get("title") or "",
+                client=client,
+                pager=None,
+            )
+    return _restore_dropped_shorts(client, result, pl)
+
+
+def _collect_playlist_pages(fetch_page):
+    """Догружает страницы, пока len(tracks) < track_count."""
+    first = None
+    collected: list = []
+    prev_sig = None
+    expected = 0
+    for page in range(40):
+        pl = fetch_page(page)
+        if not pl:
+            break
+        if first is None:
+            first = pl
+        chunk = list(pl.tracks or [])
+        expected = max(
+            expected,
+            int(getattr(pl, "track_count", 0) or 0),
+            int(getattr(getattr(pl, "pager", None), "total", 0) or 0),
+        )
+        sig = tuple(str(getattr(s, "id", "") or "") for s in chunk)
+        if page and sig and sig == prev_sig:
+            # Повтор страницы: дальше листать бесполезно (остаток доберём likes / raw JSON).
+            break
+        prev_sig = sig
+        collected.extend(chunk)
+        if not chunk:
+            break
+        if expected and len(collected) >= expected:
+            break
+    if first is not None:
+        first.tracks = collected
+        if expected:
+            first.track_count = max(int(first.track_count or 0), expected)
+    return first
+
+
+def _tracks_chunk(client, ids: list[str]) -> list:
+    if not ids:
+        return []
+    try:
+        return list(client.tracks(ids, timeout=_PL_TIMEOUT) or [])
+    except Exception:
+        if len(ids) <= 1:
+            return []
+        mid = max(1, len(ids) // 2)
+        out = []
+        out.extend(_tracks_chunk(client, ids[:mid]))
+        out.extend(_tracks_chunk(client, ids[mid:]))
+        return out
+
+
+def _hydrate_tracks(client, ids: list[str]) -> dict:
+    """Пакетно тянет Track по id / id:album (пачками — /tracks режет длинные списки)."""
+    uniq, seen = [], set()
+    for i in ids:
+        if i and i not in seen:
+            seen.add(i)
+            uniq.append(i)
+    if not client or not uniq:
+        return {}
+    by_id: dict = {}
+    for i in range(0, len(uniq), _TRACKS_BATCH):
+        by_id.update(_index_ym_tracks(_tracks_chunk(client, uniq[i:i + _TRACKS_BATCH])))
+    missing = [i for i in uniq if i not in by_id and i.split(":")[0] not in by_id]
+    if missing:
+        bare = []
+        for i in missing:
+            b = i.split(":")[0]
+            if b and b not in bare:
+                bare.append(b)
+        for i in range(0, len(bare), _TRACKS_BATCH):
+            by_id.update(_index_ym_tracks(_tracks_chunk(client, bare[i:i + _TRACKS_BATCH])))
+    return by_id
+
+
+def _bare_track_id(short) -> str:
+    tid = str(getattr(short, "id", "") or "")
+    return tid.split(":", 1)[0] if tid else ""
+
+
+def _unique_shorts(shorts) -> list:
+    """Один трек — одна строка (id и id:album у лайков часто дублируются)."""
+    out, seen = [], set()
+    for s in shorts or []:
+        key = _bare_track_id(s)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
+
+
+def liked_track_shorts(client) -> list:
+    likes = client.users_likes_tracks()
+    return _unique_shorts(list(getattr(likes, "tracks", None) or []))
+
+
+def _merge_liked_tracks(client, pl):
+    """
+    «Мне нравится»: только users_likes_tracks(), без склейки со страницами
+    плейлиста kind=3 — иначе дубли id / id:album и число больше, чем в вебе.
+    """
+    if pl is None:
+        return pl
+    try:
+        shorts = liked_track_shorts(client)
+    except Exception:
+        shorts = _unique_shorts(list(pl.tracks or []))
+    if shorts:
+        pl.tracks = shorts
+    else:
+        pl.tracks = _unique_shorts(list(pl.tracks or []))
+    pl.track_count = len(pl.tracks or [])
+    if getattr(pl, "client", None) is None:
+        pl.client = client
+    return pl
+
+
+def fetch_user_playlist(client, kind, user_id=None):
+    """Плейлист со всеми страницами и rich-tracks (без этого .track часто пустой)."""
+    uid = user_id if user_id is not None else _account_uid(client)
+    url = f"{client.base_url}/users/{uid}/playlists/{kind}"
+    pl = _collect_playlist_pages(lambda page: _get_playlist_by_url(client, url, page))
+    if str(kind) == "3":
+        pl = _merge_liked_tracks(client, pl)
+    return pl
+
+
+def fetch_shared_playlist(client, playlist_id):
+    """Общий плейлист по UUID — те же page-size / rich-tracks / страницы."""
+    url = f"{client.base_url}/playlist/{playlist_id}"
+    return _collect_playlist_pages(lambda page: _get_playlist_by_url(client, url, page))
+
+
 def tracks_from_playlist(pl, url: str) -> list[dict]:
-    """
-    Извлекает треки из Playlist.
-    TrackShort.track содержит полный Track — fetch_track() не нужен.
-    """
-    result = []
-    for i, short in enumerate(pl.tracks or [], 1):
+    """TrackShort из плейлиста часто без .track — дотягиваем пакетно через tracks()."""
+    shorts = list(pl.tracks or [])
+    client = getattr(pl, "client", None)
+    need: list[str] = []
+    for short in shorts:
         if short is None:
             continue
-        t = short.track if (short.track is not None) else None
-        if t is None:
-            try:
-                t = short.fetch_track()
-            except Exception:
-                t = None
-        if t is None:
+        inner = getattr(short, "track", None)
+        if inner is None or _track_is_stub(inner):
+            need.extend(_short_id_keys(short))
+            if client is None:
+                client = getattr(short, "client", None)
+    fetched = _hydrate_tracks(client, need)
+    result = []
+    leftovers = 0
+    for i, short in enumerate(shorts, 1):
+        if short is None:
+            result.append(_unavailable_track_dict(f"unknown_{i}", url, i))
+            continue
+        t = getattr(short, "track", None)
+        if t is None or _track_is_stub(t):
+            t = None
+            for key in _short_id_keys(short):
+                t = fetched.get(key) or fetched.get(key.split(":")[0])
+                if t is not None:
+                    break
+            if t is None and leftovers < 15 and client is not None:
+                leftovers += 1
+                try:
+                    keys = _short_id_keys(short)[:1]
+                    got = _tracks_chunk(client, keys) if keys else []
+                    t = got[0] if got else None
+                except Exception:
+                    t = None
+        if t is None or _track_is_stub(t):
             result.append(_unavailable_track_dict(getattr(short, "id", None), url, i))
             continue
         result.append(track_to_dict(t, url, i))
@@ -344,8 +629,49 @@ def _http_download(url: str, dest: Path, timeout: int = 60) -> None:
         raise
 
 
+def _tag_fields(path: Path, ym_track, track_id: str) -> tuple[str, str, str, str]:
+    title = getattr(ym_track, "title", None) or path.stem
+    artists = ", ".join(a.name for a in (getattr(ym_track, "artists", None) or []) if a and a.name)
+    album = ""
+    if getattr(ym_track, "albums", None):
+        a0 = ym_track.albums[0]
+        if a0:
+            album = a0.title or ""
+    return title, artists, album, str(track_id or "")
+
+
+def _write_mp4_tags(path: Path, ym_track, track_id: str, cover_bytes: bytes) -> None:
+    try:
+        from mutagen.mp4 import MP4, MP4Cover
+    except Exception:
+        return
+    try:
+        audio = MP4(path)
+    except Exception:
+        return
+    title, artists, album, tid = _tag_fields(path, ym_track, track_id)
+    audio["\xa9nam"] = [title]
+    if artists:
+        audio["\xa9ART"] = [artists]
+    if album:
+        audio["\xa9alb"] = [album]
+    if tid:
+        audio["\xa9cmt"] = [tid]
+    if cover_bytes:
+        fmt = MP4Cover.FORMAT_PNG if cover_bytes[:8] == b"\x89PNG\r\n\x1a\n" else MP4Cover.FORMAT_JPEG
+        audio["covr"] = [MP4Cover(cover_bytes, imageformat=fmt)]
+    try:
+        audio.save()
+    except Exception:
+        pass
+
+
 def _write_audio_tags(path: Path, ym_track, track_id: str, cover_bytes: bytes) -> None:
-    """ID3: название можно оставить со слэшем — ломается только путь файла."""
+    """Теги + обложка: ID3 для mp3, covr для m4a. Слэш в названии в файле допустим."""
+    suffix = path.suffix.lower()
+    if suffix in {".m4a", ".mp4", ".aac"}:
+        _write_mp4_tags(path, ym_track, track_id, cover_bytes)
+        return
     try:
         from mutagen.id3 import APIC, COMM, ID3, TALB, TIT2, TPE1, WOAR
         try:
@@ -360,20 +686,15 @@ def _write_audio_tags(path: Path, ym_track, track_id: str, cover_bytes: bytes) -
         tags = ID3()
     except Exception:
         return
-    title = getattr(ym_track, "title", None) or path.stem
-    artists = ", ".join(a.name for a in (getattr(ym_track, "artists", None) or []) if a and a.name)
-    album = ""
-    if getattr(ym_track, "albums", None):
-        a0 = ym_track.albums[0]
-        if a0:
-            album = a0.title or ""
+    title, artists, album, tid = _tag_fields(path, ym_track, track_id)
     tags["TIT2"] = TIT2(encoding=3, text=title)
     if artists:
         tags["TPE1"] = TPE1(encoding=3, text=artists)
     if album:
         tags["TALB"] = TALB(encoding=3, text=album)
-    tags.add(COMM(encoding=3, lang="eng", desc="yandex", text=str(track_id)))
-    tags.add(WOAR(url=f"https://music.yandex.ru/track/{track_id}"))
+    if tid:
+        tags.add(COMM(encoding=3, lang="eng", desc="yandex", text=tid))
+        tags.add(WOAR(url=f"https://music.yandex.ru/track/{tid}"))
     if cover_bytes:
         mime = "image/png" if cover_bytes[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
         tags.delall("APIC")
@@ -399,17 +720,27 @@ class YMClient:
         self._wave_batch_id: str | None = None
         self._wave_last_id: str | None = None
         self._lyrics_cache: dict[str, dict | None] = {}
+        self.last_playlist_meta: dict | None = None
+
+    def _require(self) -> Client:
+        c = self._client
+        if not c:
+            raise RuntimeError("Клиент не инициализирован")
+        return c
+
+    def _clear_session(self) -> None:
+        self._client = None
+        self._wave_session_id = None
+        self._wave_batch_id = None
+        self._wave_last_id = None
+        self._lyrics_cache.clear()
 
     # ── Авторизация ────────────────────────────────────────────────────────
 
     def reset(self) -> None:
         """Сбрасывает клиент и сессию волны — после выхода или смены токена."""
         with self._lock:
-            self._client = None
-            self._wave_session_id = None
-            self._wave_batch_id = None
-            self._wave_last_id = None
-            self._lyrics_cache.clear()
+            self._clear_session()
 
     def ensure(self, token: str) -> bool:
         """Инициализирует клиент по токену. Возвращает True при успехе."""
@@ -418,6 +749,7 @@ class YMClient:
                 return True
             try:
                 self._client = Client(token).init()
+                self._client._request.set_timeout(_PL_TIMEOUT)
                 return True
             except Exception:
                 self._client = None
@@ -461,13 +793,15 @@ class YMClient:
     # ── Список своих плейлистов ────────────────────────────────────────────
 
     def get_my_playlists(self) -> list[dict]:
+        return self._get_my_playlists()
+
+    def _get_my_playlists(self) -> list[dict]:
         c = self._client
         if not c:
             return []
 
         uid = c.me.account.uid if c.me and c.me.account else None
 
-        # 1. Системный плейлист "Мне нравится" (Лайкнутые треки)
         def _system() -> list[dict]:
             if not uid:
                 return []
@@ -485,33 +819,37 @@ class YMClient:
                 return []
             if not liked_pl.title:
                 liked_pl.title = "Мне нравится"
-            return [playlist_to_dict(liked_pl, "system")]
+            card = playlist_to_dict(liked_pl, "system")
+            try:
+                card["count"] = len(liked_track_shorts(c))
+            except Exception:
+                pass
+            return [card]
 
-        # 2. Умные плейлисты Яндекса (Плейлист дня, Премьера, Дежавю и т.д.)
         def _smart() -> list[dict]:
             feed = c.feed()
-            if not feed or not getattr(feed, 'generated_playlists', None):
+            if not feed or not getattr(feed, "generated_playlists", None):
                 return []
             return [
                 playlist_to_dict(g.data, "smart")
-                for g in feed.generated_playlists if getattr(g, 'data', None)
+                for g in feed.generated_playlists if getattr(g, "data", None)
             ]
 
-        # 3. Созданные пользователем плейлисты
         def _created() -> list[dict]:
             return [playlist_to_dict(pl, "created") for pl in (c.users_playlists_list() or [])]
 
-        # 4. Лайкнутые чужие плейлисты
         def _liked() -> list[dict]:
             return [
                 playlist_to_dict(item.playlist, "liked")
-                for item in (c.users_likes_playlists() or []) if getattr(item, 'playlist', None)
+                for item in (c.users_likes_playlists() or []) if getattr(item, "playlist", None)
             ]
 
-        # Четыре независимых запроса к API: последовательно это заметная пауза
-        # перед показом страницы, поэтому запускаем их одновременно.
-        sections = [("Мне нравится", _system), ("умные плейлисты", _smart),
-                    ("созданные плейлисты", _created), ("лайкнутые плейлисты", _liked)]
+        sections = [
+            ("Мне нравится", _system),
+            ("умные плейлисты", _smart),
+            ("созданные плейлисты", _created),
+            ("лайкнутые плейлисты", _liked),
+        ]
         result: list[dict] = []
         with ThreadPoolExecutor(max_workers=len(sections)) as pool:
             futures = [(name, pool.submit(fn)) for name, fn in sections]
@@ -524,9 +862,10 @@ class YMClient:
 
     def create_playlist(self, title: str) -> dict:
         """Создаёт свой плейлист (приватный) и возвращает карточку для интерфейса."""
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._create_playlist(title)
+
+    def _create_playlist(self, title: str) -> dict:
+        c = self._require()
         name = (title or "").strip()
         if not name:
             raise ValueError("Введите название плейлиста")
@@ -537,16 +876,17 @@ class YMClient:
 
     def rename_playlist(self, playlist_kind, title: str) -> dict:
         """Переименовывает плейлист, созданный самим пользователем."""
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._rename_playlist(playlist_kind, title)
+
+    def _rename_playlist(self, playlist_kind, title: str) -> dict:
+        self._require()
         kind = int(str(playlist_kind).strip())
         if kind == self.LIKED_PLAYLIST_KIND:
             raise RuntimeError("Системный плейлист «Мне нравится» переименовать нельзя")
         name = (title or "").strip()
         if not name:
             raise ValueError("Введите название плейлиста")
-        pl = c.users_playlists_name(kind, name)
+        pl = self._require().users_playlists_name(kind, name)
         if pl:
             return playlist_to_dict(pl, "created")
         return {
@@ -561,9 +901,10 @@ class YMClient:
 
     def delete_playlist(self, playlist_kind) -> bool:
         """Удаляет плейлист, созданный самим пользователем."""
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._delete_playlist(playlist_kind)
+
+    def _delete_playlist(self, playlist_kind) -> bool:
+        c = self._require()
         kind = int(playlist_kind)
         if kind == self.LIKED_PLAYLIST_KIND:
             raise RuntimeError("Системный плейлист «Мне нравится» удалить нельзя")
@@ -575,10 +916,10 @@ class YMClient:
 
     def get_artist(self, artist_id) -> dict:
         """Исполнитель: популярные треки + дискография (один запрос к API)."""
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._get_artist(artist_id)
 
+    def _get_artist(self, artist_id) -> dict:
+        c = self._require()
         info = c.artists_brief_info(artist_id)
         if not info or not info.artist:
             raise ValueError("Исполнитель не найден")
@@ -589,7 +930,6 @@ class YMClient:
             for i, t in enumerate(info.popular_tracks or [], 1)
         ]
         if not tracks:
-            # У некоторых исполнителей popular_tracks пуст — берём обычный список
             try:
                 res = c.artists_tracks(artist_id, page_size=50)
                 tracks = [track_to_dict(t, source, i)
@@ -610,13 +950,12 @@ class YMClient:
 
     def get_artist_tracks(self, artist_id, page: int = 0, page_size: int = 200) -> dict:
         """Все треки исполнителя одним ответом (страницы API запрашиваются внутри)."""
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._get_artist_tracks(artist_id, page, page_size)
 
+    def _get_artist_tracks(self, artist_id, page: int = 0, page_size: int = 200) -> dict:
+        c = self._require()
         source = f"https://music.yandex.ru/artist/{artist_id}/tracks"
         tracks, total, page_i = [], None, 0
-        # page оставлен для совместимости вызова, но всегда собираем полный список
         while page_i < 80:
             res = c.artists_tracks(artist_id, page=page_i, page_size=page_size)
             raw = (res.tracks if res else None) or []
@@ -639,14 +978,13 @@ class YMClient:
 
     def get_album(self, album_id) -> dict:
         """Альбом со списком треков."""
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._get_album(album_id)
 
+    def _get_album(self, album_id) -> dict:
+        c = self._require()
         al = c.albums_with_tracks(album_id)
         if not al:
             raise ValueError("Альбом не найден")
-
         source = f"https://music.yandex.ru/album/{album_id}"
         tracks, num = [], 1
         for vol in (al.volumes or []):
@@ -655,14 +993,24 @@ class YMClient:
                 num += 1
         return {"album": album_to_dict(al), "tracks": tracks}
 
-    # ── Получение треков по URL ────────────────────────────────────────────
-
     def fetch_tracks(self, url: str) -> list[dict]:
         """Возвращает список треков для одного URL."""
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._fetch_tracks(url)
 
+    def _playlist_tracks(self, pl, url: str) -> list[dict]:
+        tracks = tracks_from_playlist(pl, url)
+        expected = int(getattr(pl, "track_count", 0) or 0)
+        title = getattr(pl, "title", None) or ""
+        self.last_playlist_meta = {
+            "title": title,
+            "track_count": expected,
+            "returned": len(tracks),
+        }
+        return tracks
+
+    def _fetch_tracks(self, url: str) -> list[dict]:
+        self.last_playlist_meta = None
+        c = self._require()
         parsed = parse_url(url)
         if not parsed:
             raise ValueError(f"Не удалось распознать URL: {url}")
@@ -687,16 +1035,16 @@ class YMClient:
             return out
 
         if kind == "playlist":
-            pl = c.users_playlists(parsed["kind"], parsed["user"])
+            pl = fetch_user_playlist(c, parsed["kind"], parsed["user"])
             if not pl:
                 raise ValueError("Плейлист не найден")
-            return tracks_from_playlist(pl, url)
+            return self._playlist_tracks(pl, url)
 
         if kind == "playlist_shared":
-            pl = c.playlist(parsed["playlist_id"])
+            pl = fetch_shared_playlist(c, parsed["playlist_id"])
             if not pl:
                 raise ValueError("Плейлист не найден")
-            return tracks_from_playlist(pl, url)
+            return self._playlist_tracks(pl, url)
 
         if kind == "artist":
             result = c.artists_tracks(parsed["artist_id"], page_size=50)
@@ -706,13 +1054,12 @@ class YMClient:
 
         return []
 
-    # ── Поиск треков ───────────────────────────────────────────────────────
-
     def search_tracks(self, text: str) -> list[dict]:
         """Полнотекстовый поиск треков в Яндекс.Музыке."""
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._search_tracks(text)
+
+    def _search_tracks(self, text: str) -> list[dict]:
+        c = self._require()
         result = c.search(text, type_="track")
         if not result or not result.tracks:
             return []
@@ -721,10 +1068,10 @@ class YMClient:
 
     def search_all(self, text: str) -> dict:
         """Поиск сразу по трекам, исполнителям и альбомам — один запрос к API."""
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._search_all(text)
 
+    def _search_all(self, text: str) -> dict:
+        c = self._require()
         result = c.search(text, type_="all")
         if not result:
             return {"tracks": [], "artists": [], "albums": []}
@@ -751,9 +1098,7 @@ class YMClient:
         self._wave_last_id = None
 
     def _rotor_post(self, path: str, payload: dict):
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        c = self._require()
         url = f"{c.base_url.rstrip('/')}/{path.lstrip('/')}"
         return c.request.post(url, json=payload)
 
@@ -866,27 +1211,31 @@ class YMClient:
         Сначала /rotor/session/* (треки уже в ответе session/new).
         Если сессия недоступна — старый rotor_station_tracks.
         """
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._get_wave_tracks(seen_ids, target, start_num, station)
 
+    def _get_wave_tracks(
+        self,
+        seen_ids: list[str] | None,
+        target: int,
+        start_num: int,
+        station: str | None,
+    ) -> tuple[list[dict], list[str]]:
+        self._require()
         st = (station or "").strip() or self.WAVE_STATION
         seen = list(seen_ids or [])
         seen_set = set(seen)
-        # Пустой seen — новый запуск волны, сессию сбрасываем
         if st != self._wave_station or not seen:
             self._reset_wave_session(st)
         else:
             self._wave_station = st
 
         try:
-            data = self._wave_session_new(st) if not self._wave_session_id else self._wave_session_more()
+            data = (self._wave_session_new(st) if not self._wave_session_id else self._wave_session_more())
             seq = self._pick(data, "sequence") or []
             collected = self._tracks_from_sequence(seq, seen, seen_set, start_num, target)
             if collected:
                 return collected, seen
             if self._wave_session_id:
-                # пустая порция — пробуем ещё раз со свежей сессией
                 self._reset_wave_session(st)
                 data = self._wave_session_new(st)
                 seq = self._pick(data, "sequence") or []
@@ -907,7 +1256,7 @@ class YMClient:
         target: int,
     ) -> tuple[list[dict], list[str]]:
         """Запасной путь: один вызов старого rotor_station_tracks."""
-        c = self._client
+        c = self._require()
         queue = seen[-1] if seen else None
         result = c.rotor_station_tracks(station, queue=queue)
         if not result or not result.sequence:
@@ -936,7 +1285,7 @@ class YMClient:
 
     def _own_playlist_kinds(self) -> set[int]:
         """kind всех плейлистов, созданных самим пользователем."""
-        c = self._client
+        c = self._require()
         kinds: set[int] = set()
         try:
             for pl in (c.users_playlists_list() or []):
@@ -948,9 +1297,9 @@ class YMClient:
 
     def _own_playlist(self, kind: int):
         """Возвращает свой плейлист по kind (с треками и актуальной revision)."""
-        c = self._client
+        c = self._require()
         uid = c.me.account.uid if c.me and c.me.account else None
-        pl = c.users_playlists(kind, uid) if uid else c.users_playlists(kind)
+        pl = fetch_user_playlist(c, kind, uid)
         if not pl:
             raise RuntimeError("Плейлист не найден")
         return pl
@@ -961,14 +1310,13 @@ class YMClient:
         В системные («Мне нравится»), умные (Плейлист дня и т.п.) и чужие
         плейлисты Яндекс добавлять треки не позволяет.
         """
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._add_track_to_playlist(playlist_kind, track_id, album_id)
 
+    def _add_track_to_playlist(self, playlist_kind, track_id, album_id) -> bool:
+        c = self._require()
         kind = int(playlist_kind)
         if kind not in self._own_playlist_kinds():
             raise RuntimeError("В этот плейлист нельзя добавлять треки — он не создан вами")
-
         pl = self._own_playlist(kind)
         c.users_playlists_insert_track(
             kind=kind,
@@ -985,14 +1333,13 @@ class YMClient:
         Для «Мне нравится» (kind=3): снятие лайка, а если трек уже снят
         с сервиса и остался серой строкой — вырезаем его из системного плейлиста.
         """
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._remove_track_from_playlist(playlist_kind, track_id)
 
+    def _remove_track_from_playlist(self, playlist_kind, track_id) -> bool:
+        self._require()
         kind = int(playlist_kind)
         if kind == self.LIKED_PLAYLIST_KIND:
             return self._remove_from_liked_playlist(track_id)
-
         self._delete_playlist_track_at(kind, track_id)
         return True
 
@@ -1001,9 +1348,10 @@ class YMClient:
         Удаляет набор треков одним проходом.
         Позиции с конца, диапазонами — иначе revision плейлиста разъедется.
         """
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._remove_tracks_from_playlist(playlist_kind, track_ids)
+
+    def _remove_tracks_from_playlist(self, playlist_kind, track_ids) -> int:
+        self._require()
         kind = int(str(playlist_kind).strip())
         ids = [str(x) for x in (track_ids or []) if str(x)]
         if not ids:
@@ -1030,7 +1378,7 @@ class YMClient:
 
     def _remove_tracks_by_ids(self, kind: int, track_ids: list[str]) -> int:
         """Удаляет указанные id из своего плейлиста, с конца и с обновлением revision."""
-        c = self._client
+        c = self._require()
         wanted = set(track_ids)
         removed = 0
         for _ in range(400):
@@ -1067,7 +1415,7 @@ class YMClient:
 
     def _delete_playlist_track_at(self, kind: int, track_id) -> None:
         """Удаляет трек из плейлиста по позиции — API не умеет удалять по id."""
-        c = self._client
+        c = self._require()
         pl = self._own_playlist(kind)
         target = str(track_id)
         index = None
@@ -1091,42 +1439,49 @@ class YMClient:
         в системном плейлисте — её нужно вырезать по позиции.
         """
         try:
-            self.set_track_liked(track_id, False)
+            self._set_track_liked(track_id, False)
         except Exception:
             pass
         try:
             self._delete_playlist_track_at(self.LIKED_PLAYLIST_KIND, track_id)
         except RuntimeError:
-            # Уже нет в плейлисте — снятие лайка было достаточно
             return True
         return True
 
-    # ── Лайки ("Мне нравится") ───────────────────────────────────────────
-
     def get_liked_track_ids(self) -> list[str]:
         """Id всех треков, отмеченных «Мне нравится»."""
+        return self._get_liked_track_ids()
+
+    def _get_liked_track_ids(self) -> list[str]:
         c = self._client
         if not c:
             return []
         likes = c.users_likes_tracks()
         if not likes:
             return []
-        # Не likes.tracks_ids — там id в виде "trackId:albumId" (TrackShort.track_id),
-        # а весь остальной код (превью, скачивание, сердечки в списках) сверяется
-        # по чистому numeric id (TrackShort.id), из-за чего лайки нигде не совпадали.
-        return [str(t.id) for t in likes.tracks]
+        seen, out = set(), []
+        for t in likes.tracks or []:
+            tid = str(getattr(t, "id", "") or "").split(":", 1)[0]
+            if tid and tid not in seen:
+                seen.add(tid)
+                out.append(tid)
+        return out
 
     def set_track_liked(self, track_id: str, liked: bool) -> bool:
         """Ставит/снимает отметку «Мне нравится» треку."""
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._set_track_liked(track_id, liked)
+
+    def _set_track_liked(self, track_id: str, liked: bool) -> bool:
+        c = self._require()
         if liked:
             return bool(c.users_likes_tracks_add(track_id))
         return bool(c.users_likes_tracks_remove(track_id))
 
     def get_liked_library(self) -> dict:
         """Любимые исполнители и понравившиеся альбомы — как в коллекции Яндекса."""
+        return self._get_liked_library()
+
+    def _get_liked_library(self) -> dict:
         c = self._client
         if not c:
             return {"artists": [], "albums": []}
@@ -1147,41 +1502,46 @@ class YMClient:
                     out.append(album_to_dict(al))
             return out
 
-        artists, albums = [], []
         with ThreadPoolExecutor(max_workers=2) as pool:
-            fa, fb = pool.submit(_artists), pool.submit(_albums)
+            fa = pool.submit(_artists)
+            fb = pool.submit(_albums)
             try:
                 artists = fa.result()
             except Exception as e:
                 print(f"Ошибка любимых исполнителей: {e}")
+                artists = []
             try:
                 albums = fb.result()
             except Exception as e:
                 print(f"Ошибка понравившихся альбомов: {e}")
+                albums = []
         return {"artists": artists, "albums": albums}
 
     def set_artist_liked(self, artist_id: str, liked: bool) -> bool:
         """Добавляет/убирает исполнителя из любимых."""
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._set_artist_liked(artist_id, liked)
+
+    def _set_artist_liked(self, artist_id: str, liked: bool) -> bool:
+        c = self._require()
         if liked:
             return bool(c.users_likes_artists_add(artist_id))
         return bool(c.users_likes_artists_remove(artist_id))
 
     def set_album_liked(self, album_id: str, liked: bool) -> bool:
         """Добавляет/убирает альбом из понравившихся."""
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._set_album_liked(album_id, liked)
+
+    def _set_album_liked(self, album_id: str, liked: bool) -> bool:
+        c = self._require()
         if liked:
             return bool(c.users_likes_albums_add(album_id))
         return bool(c.users_likes_albums_remove(album_id))
 
-    # ── Дизлайки ("Не рекомендовать") ────────────────────────────────────
-
     def get_disliked_library(self) -> dict:
         """Треки и исполнители с отметкой «Не рекомендовать»."""
+        return self._get_disliked_library()
+
+    def _get_disliked_library(self) -> dict:
         c = self._client
         if not c:
             return {"tracks": [], "artists": []}
@@ -1212,44 +1572,47 @@ class YMClient:
                     out.append(artist_to_dict(a))
             return out
 
-        tracks, artists = [], []
         with ThreadPoolExecutor(max_workers=2) as pool:
-            ft, fa = pool.submit(_tracks), pool.submit(_artists)
+            ft = pool.submit(_tracks)
+            fa = pool.submit(_artists)
             try:
                 tracks = ft.result()
             except Exception as e:
                 print(f"Ошибка дизлайков треков: {e}")
+                tracks = []
             try:
                 artists = fa.result()
             except Exception as e:
                 print(f"Ошибка дизлайков исполнителей: {e}")
+                artists = []
         return {"tracks": tracks, "artists": artists}
 
     def set_track_disliked(self, track_id: str, disliked: bool) -> bool:
         """Ставит/снимает отметку «Не рекомендовать» треку."""
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._set_track_disliked(track_id, disliked)
+
+    def _set_track_disliked(self, track_id: str, disliked: bool) -> bool:
+        c = self._require()
         if disliked:
             return bool(c.users_dislikes_tracks_add(track_id))
         return bool(c.users_dislikes_tracks_remove(track_id))
 
     def set_artist_disliked(self, artist_id: str, disliked: bool) -> bool:
         """Ставит/снимает отметку «Не рекомендовать» исполнителю."""
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._set_artist_disliked(artist_id, disliked)
+
+    def _set_artist_disliked(self, artist_id: str, disliked: bool) -> bool:
+        c = self._require()
         if disliked:
             return bool(c.users_dislikes_artists_add(artist_id))
         return bool(c.users_dislikes_artists_remove(artist_id))
 
-    # ── Текст песни ───────────────────────────────────────────────────────
-
     def get_lyrics_files(self, track_id: str) -> dict:
         """Сырые LRC и TEXT с API. Не выдумывает текст."""
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._get_lyrics_files(track_id)
+
+    def _get_lyrics_files(self, track_id: str) -> dict:
+        c = self._require()
         out: dict[str, str | None] = {"lrc": None, "text": None}
         for fmt, key in (("LRC", "lrc"), ("TEXT", "text")):
             try:
@@ -1263,11 +1626,12 @@ class YMClient:
 
     def get_lyrics(self, track_id: str) -> dict | None:
         """Текст песни. Сначала LRC (тайминг строк), иначе обычный TEXT."""
+        return self._get_lyrics(track_id)
+
+    def _get_lyrics(self, track_id: str) -> dict | None:
         if track_id in self._lyrics_cache:
             return self._lyrics_cache[track_id]
-        c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        c = self._require()
         payload = {"text": None, "sync": None}
         for fmt in ("LRC", "TEXT"):
             try:
@@ -1290,8 +1654,6 @@ class YMClient:
         self._lyrics_cache[track_id] = out
         return out
 
-    # ── Скачивание трека (обход CLI, если в имени / : * и т.п.) ─────────
-
     def download_track_to(self, track_id: str, dest: Path, cfg: dict | None = None) -> Path:
         """
         Качает трек средствами yandex_music в уже безопасный dest.
@@ -1302,29 +1664,11 @@ class YMClient:
         token = str(cfg.get("token") or "").strip()
         if token:
             self.ensure(token)
-        with self._lock:
-            c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
-
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
-
-        with self._lock:
-            infos = c.tracks_download_info(track_id, get_direct_links=True)
-            tracks = c.tracks(track_id) or []
-            ym_track = tracks[0] if tracks else None
-            best = _pick_download_info(infos, str(cfg.get("quality", "2")))
-            if not best:
-                raise RuntimeError("Нет ссылки на скачивание")
-            link = best.direct_link or best.get_direct_link()
-            cover_bytes = b""
-            if cfg.get("embed_cover") and ym_track is not None:
-                cover_bytes = _cover_bytes(ym_track, cfg.get("cover_resolution", "original"))
-
+        link, ym_track, cover_bytes = self._download_meta(track_id, cfg)
         if not link:
             raise RuntimeError("Пустая ссылка на файл")
-
         timeout = 60
         try:
             timeout = max(20, int(cfg.get("timeout") or 60))
@@ -1334,18 +1678,31 @@ class YMClient:
         _write_audio_tags(dest, ym_track, track_id, cover_bytes)
         return dest
 
-    # ── Превью / прямая ссылка ────────────────────────────────────────────
+    def _download_meta(self, track_id: str, cfg: dict) -> tuple[str, object, bytes]:
+        c = self._require()
+        infos = c.tracks_download_info(track_id, get_direct_links=True)
+        tracks = c.tracks(track_id) or []
+        ym_track = tracks[0] if tracks else None
+        best = _pick_download_info(infos, str(cfg.get("quality", "2")))
+        if not best:
+            raise RuntimeError("Нет ссылки на скачивание")
+        link = best.direct_link
+        if not link:
+            link = best.get_direct_link()
+        cover_bytes = b""
+        if cfg.get("embed_cover") and ym_track is not None:
+            cover_bytes = _cover_bytes(ym_track, cfg.get("cover_resolution", "original"))
+        return link, ym_track, cover_bytes
 
     def get_preview_url(self, track_id: str) -> str:
         """Возвращает прямую ссылку на аудио (лучшее mp3) для превью."""
-        with self._lock:
-            c = self._client
-        if not c:
-            raise RuntimeError("Клиент не инициализирован")
+        return self._get_preview_url(track_id)
+
+    def _get_preview_url(self, track_id: str) -> str:
+        c = self._require()
         infos = c.tracks_download_info(track_id, get_direct_links=True)
         if not infos:
             raise ValueError("Нет ссылок на скачивание")
-        # Берём лучший mp3 (не flac) — для превью в браузере
         mp3s = [i for i in infos if i.codec == "mp3"]
         best = max(mp3s or infos, key=lambda i: i.bitrate_in_kbps or 0)
         return best.direct_link or best.get_direct_link()

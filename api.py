@@ -54,6 +54,7 @@ class Api:
         self._fetch_cancel = threading.Event()
         self._fetch_thread: Optional[threading.Thread] = None
         self._search_seq = 0
+        self._search_seqs: dict[str, int] = {}
         self._dl_index_lock = threading.Lock()
 
     # ── Утилиты ───────────────────────────────────────────────────────────
@@ -234,7 +235,16 @@ class Api:
                 try:
                     tracks = self._ym.fetch_tracks(url)
                     all_tracks.extend(tracks)
-                    self._log(f"Найдено {len(tracks)} трек(ов) — {url[:60]}", "ok")
+                    meta = getattr(self._ym, "last_playlist_meta", None)
+                    if meta:
+                        expected = int(meta.get("track_count") or 0)
+                        got = int(meta.get("returned") or len(tracks))
+                        kind = "ok" if (not expected or got >= expected) else "err"
+                        title = meta.get("title") or ""
+                        who = f" «{title}»" if title else ""
+                        self._log(f"Плейлист{who}: загружено {got}, track_count={expected}", kind)
+                    else:
+                        self._log(f"Найдено {len(tracks)} трек(ов) — {url[:60]}", "ok")
                 except Exception as e:
                     self._log(f"Ошибка: {e}", "err")
 
@@ -245,16 +255,24 @@ class Api:
 
     # ── Поиск треков ──────────────────────────────────────────────────────
 
-    def search_tracks(self, query: str, seq: int = 0) -> None:
+    def search_tracks(self, query: str, seq: int = 0, ctx: str = "") -> None:
         """
         Поиск по трекам, исполнителям и альбомам → py:search_results.
         seq возвращается как есть: интерфейс печатает быстрее, чем отвечает API,
         и по нему отбрасывает ответы на уже неактуальные запросы.
+        ctx отделяет выдачу вкладки «Поиск» от поиска внутри плейлиста,
+        чтобы они не отменяли друг друга.
         """
-        self._search_seq = seq
+        key = ctx or "search"
+        self._search_seqs[key] = seq
+        if key == "search":
+            self._search_seq = seq
 
         def _worker():
-            empty = {"query": query, "seq": seq, "tracks": [], "artists": [], "albums": []}
+            empty = {
+                "query": query, "seq": seq, "tracks": [], "artists": [], "albums": [],
+                "ctx": ctx or "",
+            }
             token = self._cfg.get("token", "").strip()
             if not token or not self._ym.ensure(token):
                 self._emit("search_results", empty)
@@ -262,9 +280,9 @@ class Api:
                 return
             try:
                 data = self._ym.search_all(query)
-                data.update({"query": query, "seq": seq})
+                data.update({"query": query, "seq": seq, "ctx": ctx or ""})
                 # Пока ходили в сеть, пользователь мог набрать уже другой запрос
-                if seq != getattr(self, "_search_seq", seq):
+                if seq != self._search_seqs.get(key, seq):
                     return
                 self._emit("search_results", data)
             except Exception as e:
@@ -285,6 +303,13 @@ class Api:
                 return
             try:
                 tracks = self._ym.fetch_tracks(url)
+                meta = getattr(self._ym, "last_playlist_meta", None) or {}
+                expected = int(meta.get("track_count") or 0)
+                got = len(tracks)
+                title = meta.get("title") or ""
+                who = f" «{title}»" if title else ""
+                kind = "ok" if (not expected or got >= expected) else "err"
+                self._log(f"Плейлист{who}: загружено {got}, track_count={expected}", kind)
                 self._emit("playlist_tracks", {"url": url, "tracks": tracks})
             except Exception as e:
                 self._log(f"Ошибка открытия плейлиста: {e}", "err")
@@ -882,10 +907,7 @@ class Api:
                         except ValueError:
                             rel = f.name
                         meta = read_audio_meta(f)
-                        cover = (
-                            f"http://127.0.0.1:5000/cover/{quote(rel, safe='/')}"
-                            if meta["has_cover"] else ""
-                        )
+                        cover = f"http://127.0.0.1:5000/cover/{quote(rel, safe='/')}"
                         files.append({
                             "id": rel,
                             "path": str(f),
